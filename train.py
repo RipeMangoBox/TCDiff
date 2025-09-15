@@ -1,9 +1,13 @@
 from args import parse_train_opt
 from TCDiff import TCDiff
 import warnings
+import pickle as pkl
 warnings.filterwarnings('ignore')
 import os
 import codecs as cs
+from dataset.preprocess import get_dataset_loader
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 def train(opt):
     # split file 
@@ -13,12 +17,27 @@ def train(opt):
         for line in f.readlines():
             split_filenames.append(line.strip())
 
+    train_dataloader = get_dataset_loader(batch_size=opt.batch_size, split="train", num_workers=8, full_length=False)
+    test_dataloader = get_dataset_loader(batch_size=1, split="test", num_workers=8, full_length=False)
+    
+    if opt.use_normalizer:
+        print("Using data normalizer")
+        dataset = train_dataloader.dataset
+        datapath = dataset.datapath
+        if not os.path.exists(os.path.join(datapath, "normalizer.pkl")):
+            from dataset.preprocess import preprocess_data
+            preprocess_data(dataset, split="train")
+        normalizer = pkl.load(
+            open(os.path.join(datapath, "normalizer.pkl"),"rb")
+        )
+        setattr(train_dataloader.dataset, "normalizer", normalizer)
+
     model = TCDiff(checkpoint_path = opt.checkpoint, learning_rate=opt.learning_rate, \
         window_size=opt.window_size, required_dancer_num = opt.required_dancer_num, split_file = split_filenames)
     if opt.mode == "train":
-        model.train_loop(opt)
+        model.train_loop(opt, train_dataloader, test_dataloader)
     elif opt.mode == "val_without_TrajModel":
-        model.given_trajectory_generation_loop(opt)
+        model.given_trajectory_generation_loop(opt, train_dataloader, test_dataloader)
     elif opt.mode == "test":
         model.test_loop(opt)
     else:

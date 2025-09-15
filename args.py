@@ -23,7 +23,7 @@ def parse_train_opt():
     parser.add_argument("--no_cache", action="store_true", default = False, help="Disable dataset caching; always reload from disk.")
         
     parser.add_argument(
-        "--required_dancer_num", type = int, default=4, help="Number of dancers required in each sample."
+        "--required_dancer_num", type = int, default=2, help="Number of dancers required in each sample."
     )
 
 
@@ -45,7 +45,7 @@ def parse_train_opt():
     parser.add_argument(
         "--save_interval",
         type=int,
-        default=50,
+        default=1,
         help='Log model after every "save_period" epoch',
     )
     parser.add_argument("--ema_interval", type=int, default=1, help="ema every x steps")
@@ -62,7 +62,9 @@ def parse_train_opt():
         # default = "./TrajDecoder/log/exp_debug/ckpt/epoch-79000.pth",
         help="trained trajectory path (optional, only used when mode is 'test')"
     )
+    parser.add_argument("--use_normalizer", action="store_true", default = True, help="Use data normalizer")
     parser.add_argument("--mode", default = "train", choices=["train", "val_without_TrajModel", "test"])
+    parser.add_argument("--save_dir", type=str, default="./runs/train", help="Path to save the model and tensorboard")
     
     opt = parser.parse_args()
     return opt

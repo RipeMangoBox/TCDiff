@@ -488,7 +488,7 @@ class DanceDecoder(nn.Module):
         # conditional projection
         # self.cond_projection = nn.Linear(cond_feature_dim, latent_dim)
         self.cond_projection = nn.Sequential(  # music-condition only, currently
-            nn.Linear(cond_feature_dim * 2, cond_feature_dim),
+            nn.Linear(cond_feature_dim, cond_feature_dim),
             nn.ReLU(),
             nn.Linear(cond_feature_dim, latent_dim),
         )
@@ -539,19 +539,19 @@ class DanceDecoder(nn.Module):
                             nn.Linear(64, latent_dim), 
                         )
 
-    def guided_forward(self, x, cond_embed, times, guidance_weight):
-        unc = self.forward(x, cond_embed, times, cond_drop_prob=1) 
-        conditioned = self.forward(x, cond_embed, times, cond_drop_prob=0) 
+    def guided_forward(self, x, lmotion, cond_embed, times, guidance_weight):
+        unc = self.forward(x, lmotion, cond_embed, times, cond_drop_prob=1) 
+        conditioned = self.forward(x, lmotion, cond_embed, times, cond_drop_prob=0) 
 
         return unc + (conditioned - unc) * guidance_weight # guidance_weight == 2
 
     def forward( 
-        self, x: Tensor, cond_embed: Tensor, times: Tensor, cond_drop_prob: float = 0.0, trj_dist = None 
+        self, x: Tensor, lmotion: Tensor, cond_embed: Tensor, times: Tensor, cond_drop_prob: float = 0.0, trj_dist = None 
     ):
         batch_size, device = x.shape[0], x.device
 
-        x = x.reshape(batch_size, -1, 151) 
-        # (b, seq_len*dn, 151)
+        x = x.reshape(batch_size, -1, 70) 
+        # (b, seq_len*dn, 70)
 
         # xz offset
         traj_emb = self.traj_embedding(x[:,1:,[4,4+1]] - x[:,:-1,[4,4+1]])  
@@ -567,13 +567,7 @@ class DanceDecoder(nn.Module):
         keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device) # torch.Size([bs])
         keep_mask_embed = rearrange(keep_mask, "b -> b 1 1") # torch.Size([bs, 1, 1])
         keep_mask_hidden = rearrange(keep_mask, "b -> b 1") # torch.Size([bs, 1])
-
-        # Music and motion lengths differ (~2x), so adjust music condition sequence length for FPS alignment.
         c_bs,cond_seq_len,_ = cond_embed.shape # (bs, 301, 438)
-        if cond_seq_len % 2 == 1: # If odd length
-            cond_embed = cond_embed[:,:-1,:].reshape(c_bs, cond_seq_len//2,-1)
-        else:
-            cond_embed = cond_embed.reshape(c_bs, cond_seq_len//2,-1)
 
         cond_tokens = self.cond_projection(cond_embed.float()) # Shape: [bs, seq_len, 876] → [bs, seq_len, 512 (latent_dim)]
         # Encode tokens
@@ -620,5 +614,5 @@ class DanceDecoder(nn.Module):
         # Pass data through the Transformer decoder, attending to conditional embeddings.
         output = self.seqTransDecoder(x, cond_tokens, t, traj_emb, self.embeddings_table.weight, trj_dist)
         
-        output = self.final_layer(output) # -> SMPL 151
+        output = self.final_layer(output) # -> SMPL 70
         return output

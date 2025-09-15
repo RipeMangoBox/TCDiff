@@ -1,0 +1,256 @@
+import torch
+from collections import OrderedDict
+from dataset.dd100lf_all2 import DD100lfAll2
+from tqdm import tqdm
+import os
+import numpy as np
+from intergen_vis import generate_one_sample
+from easydict import EasyDict
+
+
+def batch_data_process(batch_data):
+    name, music, lmotion, fmotion, motion_lens = batch_data
+
+    batch = OrderedDict({})
+    batch["wavnames"] = name
+    batch["fmotion"] = fmotion
+    batch["lmotion"] = lmotion
+    batch["music"] = music
+    return batch
+
+def motion_process_backward(lmotion, fmotion, duration=None, motion_normalizer=None):
+    if motion_normalizer is not None:
+        lmotion = motion_normalizer.backward(lmotion)[:, :duration, :22*3]
+        fmotion = motion_normalizer.backward(fmotion)[:, :duration, :22*3]
+    
+    lmotion = lmotion.cpu().data.numpy()
+    fmotion = fmotion.cpu().data.numpy()
+    return lmotion[0], fmotion[0]
+
+def DD100lf_data_loader(data_cfg, num_workers, shuffle=False, full_length=False):
+    dataset = DD100lfAll2(
+        data_cfg.music_root, 
+        data_cfg.data_root, 
+        split=data_cfg.split, 
+        full_length=full_length
+    )
+    
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=data_cfg.batch_size if not full_length else 1,
+        num_workers=num_workers,
+        pin_memory=True,
+        shuffle=shuffle,
+        drop_last=True,
+        # sampler=sampler,
+        # collate_fn=custom_collate_fn,
+    )
+    
+def DD100lf_dl(num_workers=16, full_length=False):
+    data_cfg = EasyDict({
+        'train': {
+            'music_root': '../ReactDance/data_lazy/music',
+            'data_root': '../ReactDance/data_lazy/motion',
+            'motion_data_txt': None,
+            'split': 'train',
+            'batch_size': 16
+        },
+        'val': {
+            'music_root': '../ReactDance/data_lazy/music',
+            'data_root': '../ReactDance/data_lazy/motion',
+            'motion_data_txt': None,
+            'split': 'test',
+            'batch_size': 16
+        },
+        'test': {
+            'music_root': '../ReactDance/data_lazy/music',
+            'data_root': '../ReactDance/data_lazy/motion',
+            'motion_data_txt': None,
+            'split': 'test',
+            'batch_size': 1
+        }
+    })
+    full_length = False
+    
+    train_dl = DD100lf_data_loader(data_cfg.train, num_workers, shuffle=True, full_length=full_length)    
+    
+    # segmented val data
+    val_dl = DD100lf_data_loader(data_cfg.val, num_workers, shuffle=False)
+    # whole test data
+    whole_test_dl = DD100lf_data_loader(data_cfg.test, num_workers, shuffle=False, full_length=True)
+    
+    return train_dl, val_dl, whole_test_dl
+
+def calc_duet_joints_vq(model, device, test_dl, mask):
+    device = device
+    with torch.no_grad():
+        model = model.to(device).eval()
+        print("GestureLSM_vq Duet Eval...", flush=True)
+        followers = []
+        leaders = []
+        fnames = []
+        for i, batch_data in enumerate(tqdm(test_dl, desc=f'[*] calc_duet_joints')):
+            batch = batch_data_process(batch_data)
+            gt_motion = batch['fmotion'][..., mask]
+            pred_motion, loss_commit, perplexity = model(gt_motion).values()
+            
+            fmotion = batch['fmotion']
+            lmotion = batch['lmotion']
+            fmotion[..., mask] = pred_motion
+            lpos, fpos = motion_process_backward(lmotion, fmotion, duration=None)
+            
+            followers.append(fpos)
+            leaders.append(lpos)
+            fnames.append(batch_data[0][0])
+        return leaders, followers, fnames
+
+def calc_duet_joints_vq_full(upper_model, lower_model, device, test_dl, upper_mask, lower_mask):
+    device = device
+    with torch.no_grad():
+        upper_model = upper_model.to(device).eval()
+        lower_model = lower_model.to(device).eval()
+        print("GestureLSM_vq Duet Eval...", flush=True)
+        followers = []
+        leaders = []
+        fnames = []
+        for i, batch_data in enumerate(tqdm(test_dl, desc=f'[*] calc_duet_joints')):
+            batch = batch_data_process(batch_data)
+            gt_upper_motion = batch['fmotion'][..., upper_mask]
+            gt_lower_motion = batch['fmotion'][..., lower_mask]
+            pred_upper_motion, loss_commit, perplexity = upper_model(gt_upper_motion).values()
+            pred_lower_motion, loss_commit, perplexity = lower_model(gt_lower_motion).values()
+            
+            fmotion = batch['fmotion']
+            lmotion = batch['lmotion']
+            fmotion[..., upper_mask] = pred_upper_motion
+            fmotion[..., lower_mask] = pred_lower_motion
+            lpos, fpos = motion_process_backward(lmotion, fmotion, duration=None)
+            
+            followers.append(fpos)
+            leaders.append(lpos)
+            fnames.append(batch_data[0][0])
+        return leaders, followers, fnames
+    
+def eval_during_training(model, duet_metric_calc, device, test_dl, mask, writer, logger, global_step):
+    jointsl_list, jointsf_list, fnames = calc_duet_joints_vq(model, device, test_dl, mask)
+    duet_metrics = duet_metric_calc.eval_duet_metrics(jointsl_list, jointsf_list, fnames)
+    
+    for key, value in duet_metrics.items():
+        writer.add_scalar(f'Eval/{key}', value, global_step)
+        logger.info(f'Eval. Iter {global_step} : {key} {value:.2f}')
+    return duet_metrics
+
+def synthesis_and_vis_vq(epoch, expdir, model, device, val_dl, test_dl, mask):
+    def synthesis_and_vis_one_sample(model, epoch, dataset, dataset_name, device, sample_num, seq_len):
+        # 对test_dl中第0下标的数据进行合成和可视化
+        device = device
+        with torch.no_grad():
+            model = model.to(device).eval()
+            for i, batch_data in enumerate(dataset):
+                # batch_data: name, text, motion1, motion2, motion_lens
+                name, text, motion1, motion2, motion_lens = batch_data
+                fname = name[0] if isinstance(name, (list, tuple)) else str(name)
+                
+                batch = batch_data_process(batch_data)
+                gt_motion = batch['fmotion'][..., mask]
+                pred_motion, loss_commit, perplexity = model(gt_motion).values()
+                fmotion = batch['fmotion']
+                lmotion = batch['lmotion']
+                fmotion[..., mask] = pred_motion
+                lpos, fpos = motion_process_backward(lmotion, fmotion, duration=seq_len)
+                
+                # 保存和可视化
+                video_dir = os.path.join(expdir, "videos")
+                os.makedirs(video_dir, exist_ok=True)
+                
+                # save video
+                motion_both = [lpos[:seq_len], fpos[:seq_len]]
+                lmask = [0] * 22
+                fmask = [int(i in [v//3 for v in mask[::3]]) for i in range(22)]
+                real_generated_motion_mask = [lmask, fmask]
+                generate_one_sample(motion_both, real_generated_motion_mask, f"{fname}_{dataset_name}_epoch{epoch}", video_dir)
+                
+                if i >= sample_num:
+                    break
+    synthesis_and_vis_one_sample(model, epoch, val_dl, 'val', device, sample_num=2, seq_len=300)
+    synthesis_and_vis_one_sample(model, epoch, test_dl, 'test', device, sample_num=1, seq_len=450)
+        
+
+def synthesis_and_vis_vq_full(expdir, upper_model, lower_model, device, val_dl, test_dl, upper_mask, lower_mask):
+    def synthesis_and_vis_one_sample(upper_model, lower_model, dataset, dataset_name, device, sample_num, seq_len):
+        # 对test_dl中第0下标的数据进行合成和可视化
+        device = device
+        with torch.no_grad():
+            upper_model = upper_model.to(device).eval()
+            lower_model = lower_model.to(device).eval()
+            for i, batch_data in enumerate(dataset):
+                # batch_data: name, text, motion1, motion2, motion_lens
+                name, text, motion1, motion2, motion_lens = batch_data
+                fname = name[0] if isinstance(name, (list, tuple)) else str(name)
+                
+                batch = batch_data_process(batch_data)
+                gt_motion = batch['fmotion']
+                pred_upper_motion, loss_commit, perplexity = upper_model(gt_motion[..., upper_mask]).values()
+                pred_lower_motion, loss_commit, perplexity = lower_model(gt_motion[..., lower_mask]).values()
+                fmotion = batch['fmotion']
+                lmotion = batch['lmotion']
+                fmotion[..., upper_mask] = pred_upper_motion
+                fmotion[..., lower_mask] = pred_lower_motion
+                lpos, fpos = motion_process_backward(lmotion, fmotion, duration=seq_len)
+                
+                # 保存和可视化
+                video_dir = os.path.join(expdir, "videos")
+                os.makedirs(video_dir, exist_ok=True)
+                
+                # save video
+                motion_both = [lpos[:seq_len], fpos[:seq_len]]
+                lmask = [0] * 22
+                fmask = [int(i in [v//3 for v in upper_mask[::3]]) or int(i in [v//3 for v in lower_mask[::3]]) for i in range(22)]
+                real_generated_motion_mask = [lmask, fmask]
+                generate_one_sample(motion_both, real_generated_motion_mask, f"{fname}_{dataset_name}", video_dir)
+                
+                if i >= sample_num:
+                    break
+    synthesis_and_vis_one_sample(upper_model, lower_model, val_dl, 'val', device, sample_num=2, seq_len=128)
+    synthesis_and_vis_one_sample(upper_model, lower_model, test_dl, 'test', device, sample_num=1, seq_len=600)
+        
+def synthesis(result_dir, model, device, test_dl, mask):
+    def synthesis_and_vis(seqlen):
+        # 对test_dl中第0下标的数据进行合成和可视化
+        device = device
+        # 保存和可视化
+        expdir = result_dir
+        synthdir = os.path.join(expdir, "test_synthesis_log")
+        npy_dir = os.path.join(synthdir, f"npy/{seqlen}")
+        video_dir = os.path.join(synthdir, f"videos/{seqlen}")
+        os.makedirs(npy_dir, exist_ok=True)
+        os.makedirs(video_dir, exist_ok=True)
+        
+        with torch.no_grad():
+            model = model.to(device).eval()
+            for batch_data in test_dl:
+                # batch_data: name, text, motion1, motion2, motion_lens
+                name, text, motion1, motion2, motion_lens = batch_data
+                fname = name[0] if isinstance(name, (list, tuple)) else str(name)
+                
+                batch = batch_data_process(batch_data)
+                output = model.forward_test(batch)['output']
+                B, T, D = output.shape
+                lmotion_output, fmotion_output = torch.split(output, [D//2, D//2], dim=-1)
+                lpos, fpos = motion_process_backward(lmotion_output, fmotion_output, duration=seqlen)
+                
+                # save npy
+                np.save(os.path.join(npy_dir, f"{fname}.npy"), np.concatenate([lpos, fpos], axis=1))
+                # save video
+                motion_both = [lpos, fpos]
+                generate_one_sample(motion_both, f"{fname}", video_dir)
+                
+    synthesis_and_vis(seqlen=128)
+    synthesis_and_vis(seqlen=None)
+        
+def save_pos3d(posf, posl, evaldir, fname, suffix='pos3d_npy'):
+    save_folder = os.path.join(evaldir, suffix)
+    os.makedirs(save_folder, exist_ok=True)
+    
+    np.save(os.path.join(save_folder, fname + '_00'), posf)
+    np.save(os.path.join(save_folder, fname + '_01'), posl)

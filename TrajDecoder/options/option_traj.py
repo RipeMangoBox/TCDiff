@@ -17,7 +17,7 @@ def get_args_parser():
 
     ## dancer_num ###
     parser.add_argument( 
-        "--required_dancer_num", type = int, default=4, help="Number of dancers required in each sample."
+        "--required_dancer_num", type = int, default=2, help="Number of dancers required in each sample."
     )
 
     ## Checkpoint paths

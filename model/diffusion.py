@@ -10,16 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import reduce
 from p_tqdm import p_map
-from pytorch3d.transforms import (axis_angle_to_quaternion,
-                                  quaternion_to_axis_angle)
 from tqdm import tqdm
 
-from dataset.quaternion import ax_from_6v, quat_slerp
 from vis import skeleton_render
-
 from .utils import extract, make_beta_schedule
 import copy
-
+from intergen_vis import generate_one_sample
 
 def identity(t, *args, **kwargs):
     return t
@@ -82,7 +78,6 @@ class GaussianDiffusion(nn.Module):
         model,
         horizon,
         repr_dim,
-        smpl,
         n_timestep=1000,
         schedule="linear",
         loss_type="l1",
@@ -102,10 +97,6 @@ class GaussianDiffusion(nn.Module):
         self.seq_len = seq_len
 
         self.cond_drop_prob = cond_drop_prob
-
-        # make a SMPL instance for FK module
-        self.smpl = smpl
-
         betas = torch.Tensor(
             make_beta_schedule(schedule=schedule, n_timestep=n_timestep)
         )
@@ -192,9 +183,9 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
     
-    def model_predictions(self, x, cond, t, weight=None, clip_x_start = False):
+    def model_predictions(self, x, lmotion, cond, t, weight=None, clip_x_start = False):
         weight = weight if weight is not None else self.guidance_weight
-        model_output = self.model.guided_forward(x, cond, t, weight) # torch.Size([2, 150, 453])
+        model_output = self.model.guided_forward(x, lmotion, cond, t, weight) # torch.Size([2, 150, 453])
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
         
         x_start = model_output
@@ -214,7 +205,7 @@ class GaussianDiffusion(nn.Module):
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, cond, t):
+    def p_mean_variance(self, x, lmotion, cond, t):
         # guidance clipping
         if t[0] > 1.0 * self.n_timestep:
             weight = min(self.guidance_weight, 0)
@@ -224,7 +215,7 @@ class GaussianDiffusion(nn.Module):
             weight = self.guidance_weight
 
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.model.guided_forward(x, cond, t, weight)
+            x, t=t, noise=self.model.guided_forward(x, lmotion, cond, t, weight)
         )
 
         if self.clip_denoised:
@@ -238,10 +229,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_recon
 
     @torch.no_grad()
-    def p_sample(self, x, cond, t):
+    def p_sample(self, x, lmotion, cond, t):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(
-            x=x, cond=cond, t=t
+            x=x, lmotion=lmotion, cond=cond, t=t
         )
         noise = torch.randn_like(model_mean)
         # no noise when t == 0
@@ -255,6 +246,7 @@ class GaussianDiffusion(nn.Module):
     def p_sample_loop(
         self,
         shape,
+        lmotion,
         cond,
         noise=None,
         constraint=None,
@@ -268,6 +260,7 @@ class GaussianDiffusion(nn.Module):
         batch_size = shape[0]
         x = torch.randn(shape, device=device) if noise is None else noise.to(device)
         cond = cond.to(device)
+        lmotion = lmotion.to(device)
 
         if return_diffusion:
             diffusion = [x]
@@ -275,7 +268,7 @@ class GaussianDiffusion(nn.Module):
         for i in tqdm(reversed(range(0, start_point))):
             # fill with i
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            x, _ = self.p_sample(x, cond, timesteps)
+            x, _ = self.p_sample(x, lmotion, cond, timesteps)
 
             if return_diffusion:
                 diffusion.append(x)
@@ -284,10 +277,9 @@ class GaussianDiffusion(nn.Module):
             return x, diffusion
         else:
             return x
-    
+
     @torch.no_grad() 
-    def ddim_sample_Footwork(self, shape, cond, x_0 = None, **kwargs):
-        # We implemented code to facilitate experiments focusing on the control of lower-limb movements.
+    def ddim_sample(self, shape, lmotion, cond, x_0 = None, **kwargs):
         batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 1
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -295,118 +287,23 @@ class GaussianDiffusion(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
         x = torch.randn(shape, device = device)
-        cond = cond.to(device)
-
-        if x_0 is not None:
-            x_0 = x_0.to(device)
-            _, seq, c = x_0.shape
-            x_0 = x_0.reshape(-1, 150, seq//150, c)
-            x = x.reshape(-1, 150, seq//150, c)
-            x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-
-            # Replace the displacement data for footsteps 1, 2, 3, 4, 5, 7, 8, 10, and 11
-            for i in [1,2,3,4,5,7,8,10,11]:
-                x[:,75:120,:,4+3+(i-1)*6:4+3+i*6] = x_0[:,75:120,:,4+3+(i-1)*6:4+3+i*6] 
-            x = x.reshape(-1, seq, c)
-
-        x_start = None
-
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(x, cond, time_cond, clip_x_start = self.clip_denoised)
-
-            if time_next < 0:
-                x = x_start
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-
-            noise = torch.randn_like(x)
-
-            x = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
-            
-            if x_0 is not None: 
-                # Replace the x_past segment with the ground truth
-                _, seq, dn, c = x_0.shape
-                x = x.reshape(-1, seq, dn, c)
-
-                # Replace the displacement components with those from x_0
-                x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-
-                # Replace the displacement data for specific footstep segments
-                for i in [1,2,3,4,5,7,8,10,11]:
-                    x[:,75:120,:,4+3+(i-1)*6:4+3+i*6] = x_0[:,75:120,:,4+3+(i-1)*6:4+3+i*6] 
-            
-                x = x.reshape(-1, seq*dn, c)
-        
-
-        if x_0 is not None: # At t == 0, step is skipped, so an extra update is necessary.
-            _, seq, dn, c = x_0.shape
-            x = x.reshape(-1, seq, dn, c)
-
-            # Replace the initial displacement components (e.g. global XY translation)
-            x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-            
-            # --- Linear interpolation fusion for specific footstep segments ---
-
-            # The following code performs partial replacement and fusion of displacement data
-            # for specific footstep segments. Instead of a hard overwrite, it uses linear
-            # interpolation at the sequence boundaries to ensure smooth transitions.
-
-            # Define the width of the interpolation window (number of frames)
-            width = 10
-            
-            # Generate weights for linear interpolation, from 0 to 1 across the defined window.
-            # Shape: (1, width, 1, 1) to broadcast across batch and feature dimensions.
-            weights = torch.from_numpy(np.linspace(0, 1, width)).to(x)
-            weights = weights[None, :, None, None]
-
-            # Loop over the selected footsteps indices (each corresponds to a segment of rotation data)
-            for i in [1,2,3,4,5,7,8,10,11]:
-                # Interpolate the start segment (smooth transition from original x to x_0)
-                x[:, 75:75 + width, :,4+3+(i-1)*6:4+3+i*6] = weights * x_0[:,75:75 + width, :,4+3+(i-1)*6:4+3+i*6] + (1-weights) * x[:, 75:75 + width, :,4+3+(i-1)*6:4+3+i*6] 
-
-                # Fully replace the middle segment with values from x_0
-                x[:, 75 + width : -width, :,4+3+(i-1)*6:4+3+i*6] = x_0[:,75 + width : -width,:,4+3+(i-1)*6:4+3+i*6] 
-
-                # Interpolate the end segment (smooth transition back to original x)
-                x[:, 120-width:120,:,4+3+(i-1)*6:4+3+i*6] = (1-weights) * x_0[:,120-width:120,:,4+3+(i-1)*6:4+3+i*6] + weights * x[:, 120-width:120,:,4+3+(i-1)*6:4+3+i*6] 
-
-            x = x.reshape(-1, seq*dn, c)
-
-        return x # torch.Size([bs, seq*dn, 151])
-
-    @torch.no_grad() 
-    def ddim_sample(self, shape, cond, x_0 = None, **kwargs):
-        batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 1
-
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-
-        x = torch.randn(shape, device = device)
+        lmotion = lmotion.to(device)
         cond = cond.to(device)
 
         if x_0 is not None:
             x_0 = x_0.to(device)
             _, seq, _ = x_0.shape 
             x_0 = x_0.reshape(-1, 150, seq//150, 3)
-            x = x.reshape(-1, 150, seq//150, 151)
+            x = x.reshape(-1, 150, seq//150, 70)
 
             x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-            x = x.reshape(-1, seq, 151)
+            x = x.reshape(-1, seq, 70)
 
         x_start = None
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(x, cond, time_cond, clip_x_start = self.clip_denoised)
+            pred_noise, x_start, *_ = self.model_predictions(x, lmotion, cond, time_cond, clip_x_start = self.clip_denoised)
 
             if time_next < 0:
                 x = x_start
@@ -426,28 +323,28 @@ class GaussianDiffusion(nn.Module):
             
             if x_0 is not None: # replace x- and y-axis trajectory
                 _, seq, dn, _ = x_0.shape
-                x = x.reshape(-1, seq, dn, 151)
+                x = x.reshape(-1, seq, dn, 70)
                 x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-                x = x.reshape(-1, seq*dn, 151)
+                x = x.reshape(-1, seq*dn, 70)
         
 
         if x_0 is not None: # At t == 0, step is skipped, so an extra update is necessary.
             _, seq, dn, _ = x_0.shape
-            x = x.reshape(-1, seq, dn, 151)
+            x = x.reshape(-1, seq, dn, 70)
             x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]] # replace x- and y-axis trajectory
  
             
-            x = x.reshape(-1, seq*dn, 151)
+            x = x.reshape(-1, seq*dn, 70)
 
-        return x # torch.Size([2, seq*dn, 151])
+        return x # torch.Size([2, seq*dn, 70])
 
 
     @torch.no_grad() 
-    def long_ddim_sample(self, shape, cond, x_0, **kwargs):
+    def long_ddim_sample(self, shape, lmotion, cond, x_0, **kwargs):
         batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 1
         
         if batch == 1:
-            return self.ddim_sample(shape, cond)
+            return self.ddim_sample(shape, lmotion, cond)
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
@@ -455,15 +352,16 @@ class GaussianDiffusion(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:], weights)) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
         x = torch.randn(shape, device = device)
+        lmotion = lmotion.to(device)
         cond = cond.to(device)
         
         if x_0 is not None:
             x_0 = x_0.to(device)
             b,seq,dn,_ = x_0.shape 
             x_0 = x_0.reshape(-1, seq, dn, 3)
-            x = x.reshape(-1, seq, dn, 151)
+            x = x.reshape(-1, seq, dn, 70)
             x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-            x = x.reshape(-1, seq*dn, 151)
+            x = x.reshape(-1, seq*dn, 70)
 
         assert batch > 1
         assert self.seq_len%2 ==0
@@ -473,7 +371,7 @@ class GaussianDiffusion(nn.Module):
 
         for time, time_next, weight in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(x, cond, time_cond, weight=weight, clip_x_start = self.clip_denoised) 
+            pred_noise, x_start, *_ = self.model_predictions(x, lmotion, cond, time_cond, weight=weight, clip_x_start = self.clip_denoised) 
 
             if time_next < 0:
                 x = x_start
@@ -495,9 +393,9 @@ class GaussianDiffusion(nn.Module):
             if x_0 is not None: 
                 # Replace the x_past portion with the ground truth values
                 _, seq, dn, _ = x_0.shape
-                x = x.reshape(-1, seq, dn, 151)
+                x = x.reshape(-1, seq, dn, 70)
                 x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-                x = x.reshape(-1, seq*dn, 151)
+                x = x.reshape(-1, seq*dn, 70)
 
             if time > 0: 
                 # the first half of each sequence is the second half of the previous one
@@ -508,9 +406,9 @@ class GaussianDiffusion(nn.Module):
         if x_0 is not None: 
             # Replace the x_past portion with the ground truth values again after all updates
             _, seq, dn, _ = x_0.shape
-            x = x.reshape(-1, seq, dn, 151)
+            x = x.reshape(-1, seq, dn, 70)
             x[:,:,:,[4,4+1]] = x_0[:,:,:,[0,1]]
-            x = x.reshape(-1, seq*dn, 151)
+            x = x.reshape(-1, seq*dn, 70)
                 
         return x # (slice_num(18), sq(150), 453)
 
@@ -519,6 +417,7 @@ class GaussianDiffusion(nn.Module):
     def inpaint_loop(
         self,
         shape,
+        lmotion,
         cond,
         noise=None,
         constraint=None,
@@ -529,6 +428,7 @@ class GaussianDiffusion(nn.Module):
 
         batch_size = shape[0]
         x = torch.randn(shape, device=device) if noise is None else noise.to(device)
+        lmotion = lmotion.to(device)
         cond = cond.to(device)
         if return_diffusion:
             diffusion = [x]
@@ -542,7 +442,7 @@ class GaussianDiffusion(nn.Module):
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
 
             # sample x from step i to step i-1
-            x, _ = self.p_sample(x, cond, timesteps)
+            x, _ = self.p_sample(x, lmotion, cond, timesteps)
             # enforce constraint between each denoising step
             value_ = self.q_sample(value, timesteps - 1) if (i > 0) else x
             # value_ = self.q_sample(value, timesteps - 1) if (i > 0) else value # This may cause abrupt positional changes, but it can be useful for verifying whether the input motion is reasonable.
@@ -560,6 +460,7 @@ class GaussianDiffusion(nn.Module):
     def long_inpaint_loop(
         self,
         shape,
+        lmotion,
         cond,
         noise=None,
         constraint=None,
@@ -570,6 +471,7 @@ class GaussianDiffusion(nn.Module):
 
         batch_size = shape[0]
         x = torch.randn(shape, device=device) if noise is None else noise.to(device)
+        lmotion = lmotion.to(device)
         cond = cond.to(device)
         if return_diffusion:
             diffusion = [x]
@@ -579,6 +481,7 @@ class GaussianDiffusion(nn.Module):
             # there's no continuation to do, just do normal
             return self.p_sample_loop(
                 shape,
+                lmotion,
                 cond,
                 noise=noise,
                 constraint=constraint,
@@ -594,7 +497,7 @@ class GaussianDiffusion(nn.Module):
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
 
             # sample x from step i to step i-1
-            x, _ = self.p_sample(x, cond, timesteps)
+            x, _ = self.p_sample(x, lmotion, cond, timesteps)
             # enforce constraint between each denoising step
             if i > 0:
                 # the first half of each sequence is the second half of the previous one
@@ -610,7 +513,7 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def conditional_sample(
-        self, shape, cond, constraint=None, *args, horizon=None, **kwargs
+        self, shape, lmotion, cond, constraint=None, *args, horizon=None, **kwargs
     ):
         """
             conditions : [ (time, state), ... ]
@@ -618,7 +521,7 @@ class GaussianDiffusion(nn.Module):
         device = self.betas.device
         horizon = horizon or self.horizon
 
-        return self.p_sample_loop(shape, cond, *args, **kwargs)
+        return self.p_sample_loop(shape, lmotion, cond, *args, **kwargs)
 
     # ------------------------------------------ training ------------------------------------------#
 
@@ -633,11 +536,11 @@ class GaussianDiffusion(nn.Module):
 
         return sample
 
-    def p_losses(self, x_start, cond, t, trj_dist = None): 
+    def p_losses(self, x_start, lmotion, cond, t, trj_dist = None): 
 
-        # (bs, dancer_num, 150, 151) -> (bs, 150, dancer_num, 151)
+        # (bs, dancer_num, 150, 70) -> (bs, 150, dancer_num, 70)
         bs, dancer_num, sq, c = x_start.shape
-        x_start = x_start.permute(0,2,1,3) # (bs, dancer_num, seq_len, 151) - > (bs, seq_len, dancer_num, 151)
+        x_start = x_start.permute(0,2,1,3) # (bs, dancer_num, seq_len, 70) - > (bs, seq_len, dancer_num, 70)
 
         # # Transition from full-noise to partial-noise scheduling, where noise is added only to the latter half of the data sequence.
         # This aims to enhance the model’s ability to retain temporal information.
@@ -651,7 +554,7 @@ class GaussianDiffusion(nn.Module):
         x_noisy = x_noisy.reshape(bs,sq*dancer_num, c)
 
         # reconstruct
-        x_recon = self.model(x_noisy, cond, t, cond_drop_prob=self.cond_drop_prob, trj_dist = trj_dist) # (bs, 150, dancer_num, 151) | model.decoder
+        x_recon = self.model(x_noisy, lmotion, cond, t, cond_drop_prob=self.cond_drop_prob, trj_dist = trj_dist) # (bs, 150, dancer_num, 70) | model.decoder
 
         model_out = x_recon
         if self.predict_epsilon: # origin DPM
@@ -661,7 +564,7 @@ class GaussianDiffusion(nn.Module):
 
 
         # split off contact from the rest
-        model_out = model_out.reshape(bs, sq, dancer_num, c) # (bs, sq(150), dancer_num(3), c(151))
+        model_out = model_out.reshape(bs, sq, dancer_num, c) # (bs, sq(150), dancer_num(3), c(70))
         target = target.reshape(bs, sq, dancer_num, c)
 
         # full reconstruction loss
@@ -670,7 +573,7 @@ class GaussianDiffusion(nn.Module):
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
 
         model_contact, model_out = torch.split(
-            model_out, (4, model_out.shape[3] - 4), dim=3 # (bs, sq(150), dancer_num(3), 3 + 22*6 == 147)
+            model_out, (4, model_out.shape[3] - 4), dim=3 # (bs, sq(150), dancer_num(3), 3 + 22*3 == 147)
         )
         target_contact, target = torch.split(target, (4, target.shape[3] - 4), dim=3) # (bs, sq(150), dancer_num(3), 4)
 
@@ -683,45 +586,11 @@ class GaussianDiffusion(nn.Module):
 
         # FK loss
         b, s, dancer_num, c = model_out.shape 
-
-        # unnormalize
-        # model_out = self.normalizer.unnormalize(model_out)
-        # target = self.normalizer.unnormalize(target)
-
-        # X, Q
-        model_x = model_out[:, :, :,:3] # root | (bs, sq, dancer_num(3), 3) -> (bs, sq * dancer_num(3), 3)
-        model_q = ax_from_6v(model_out[:, :, :, 3:].reshape(b, s*dancer_num, -1, 6)) # body | (bs, sq, dancer_num(3), c-3) -> (bs, sq*dancer_num(3), (c-3)) -> (bs, sq*dancer_num(3), 24, 6)
-        target_x = target[:, :, :,:3] # gt root | (bs, sq, dancer_num(3), 3)
-        target_q = ax_from_6v(target[:, :, :, 3:].reshape(b, s*dancer_num, -1, 6)) # gt body | (bs, sq, dancer_num(3), c-3) -> (bs, sq*dancer_num(3), (c-3)) -> (bs, sq*dancer_num(3), 24, 6)
-
-        # offset -> xyz | or not
-        # model_x = offset2xyz(model_x) # [2, 453, 3]
-        # target_x = offset2xyz(target_x)
-        # model_x = offset2xy(model_x) # [2, 453, 3]
-        # target_x = offset2xy(target_x)
-
-        model_x = model_x.reshape(b, s*dancer_num, -1)
-        target_x = target_x.reshape(b, s*dancer_num, -1)
-
-        # perform FK
-        model_xp = self.smpl.forward(model_q, model_x) # (bs, sq*dancer_num(3), 24, 3)
-        target_xp = self.smpl.forward(target_q, target_x)
-
-        # compute relative distence
-        model_relative = model_xp[:,:,1:] - model_xp[:,:,0:1]
-        target_relative = target_xp[:,:,1:] - target_xp[:,:,0:1]
-
-        # relative fk loss
-        fk_loss = self.loss_fn(model_relative, target_relative, reduction="none") 
-        fk_loss = reduce(fk_loss, "b ... -> b (...)", "mean")
-        fk_loss = fk_loss * extract(self.p2_loss_weight, t, fk_loss.shape)
-
-        # foot skate loss
         foot_idx = [7, 8, 10, 11]
 
         static_idx = model_contact > 0.95  # N x S x 4 -> N x S x dancer_num x 4
-        model_xp = model_xp.reshape(b, s, dancer_num, 24, 3) # (bs, sq, dancer_num(3), 24, 3)
-        model_feet = model_xp[:, :, :,foot_idx]  # foot positions (bs, sq, dancer_num(3), 4, 3)
+        model_out = model_out.reshape(b, s, dancer_num, 22, 3) # (bs, sq, dancer_num(3), 22, 3)
+        model_feet = model_out[:, :, :,foot_idx]  # foot positions (bs, sq, dancer_num(3), 4, 3)
         model_foot_v = torch.zeros_like(model_feet)
         model_foot_v[:, :-1] = ( # v (bs, sq, dancer_num(3), 4, 3)
             model_feet[:, 1:, :, :, :] - model_feet[:, :-1, :, :, :]
@@ -735,27 +604,26 @@ class GaussianDiffusion(nn.Module):
         losses = (
             0.636 * loss.mean(),
             2.964 * v_loss.mean(),
-            0.646 * fk_loss.mean(),
             10.942 * foot_loss.mean(),  
         )
         return sum(losses), losses
 
 
-    def loss(self, x, cond, t_override=None, trj_dist = None): 
+    def loss(self, x, lmotion, cond, t_override=None, trj_dist = None): 
         batch_size = len(x)
         if t_override is None:
             t = torch.randint(0, self.n_timestep, (batch_size,), device=x.device).long()
         else:
             t = torch.full((batch_size,), t_override, device=x.device).long()
-        return self.p_losses(x, cond, t, trj_dist = trj_dist)
+        return self.p_losses(x, lmotion, cond, t, trj_dist = trj_dist)
 
-    def forward(self, x, cond, t_override=None, trj_dist = None): 
-        return self.loss(x, cond, t_override, trj_dist = trj_dist)
+    def forward(self, x, lmotion, cond, t_override=None, trj_dist = None): 
+        return self.loss(x, lmotion, cond, t_override, trj_dist = trj_dist)
     
 
-    def partial_denoise(self, x, cond, t):
+    def partial_denoise(self, x, lmotion, cond, t):
         x_noisy = self.noise_to_t(x, t)
-        return self.p_sample_loop(x.shape, cond, noise=x_noisy, start_point=t)
+        return self.p_sample_loop(x.shape, lmotion, cond, noise=x_noisy, start_point=t)
 
     def noise_to_t(self, x, timestep):
         batch_size = len(x)
@@ -765,11 +633,11 @@ class GaussianDiffusion(nn.Module):
     def render_sample( 
         self,
         shape,
+        lmotion,
         cond,
         normalizer,
         epoch,
         render_out,
-        fk_out=None,
         name=None,
         sound=True,
         mode="normal",
@@ -796,6 +664,7 @@ class GaussianDiffusion(nn.Module):
             samples = (
                 func_class(
                     shape,
+                    lmotion,
                     cond,
                     noise=noise,
                     constraint=constraint,
@@ -809,39 +678,26 @@ class GaussianDiffusion(nn.Module):
             samples = shape
 
         # (b, s*dancer_num, c)
-        b,s,_ = samples.shape # [*, 450, 151]
-        samples = normalizer.unnormalize(samples) # torch.Size([2, 150*dancer_num, 151])
+        b,s,_ = samples.shape # [*, 450, 70]
+        samples = normalizer.unnormalize(samples) # torch.Size([2, 150*dancer_num, 70])
 
         # (b, s*dancer_num, c) -> (b, s, dancer_num, c)
-        samples = samples.reshape(b, 150, s//150, 151) # [*, 150, 3, 151]
+        samples = samples.reshape(b, 150, s//150, 70) # [*, 150, 3, 70]
         b, s, ds, c = samples.shape # In long_DDPM_sample, b refers to the number of audio segments rather than the batch size.
 
-        if len(samples.shape) == 4 and samples.shape[3] == 151: # (b, s, dancer_num, c)
+        if len(samples.shape) == 4 and samples.shape[3] == 70: # (b, s, dancer_num, c)
             sample_contact, samples = torch.split(
                 samples, (4, samples.shape[3] - 4), dim=3
             )
         else:
             sample_contact = None
 
-        # do the FK all at once
-            # pos offset -> xyz
-        # We tried transforming the offset representation into absolute 3D or 2D positions,
-            # but this approach did not show significant benefits:
-        # pos = offset2xyz(samples[:, :, :, :3]).to(cond.device)  # (b, s*dn, 3)
-        # pos = offset2xy(samples[:, :, :, :3]).to(cond.device)   # (b, s*dn, 3)
-
         samples = samples.reshape(b,-1,c-4) # (b, s, dancer_num, c-4(147)) -> (b, s*dancer_num, c-4(147))
         b, s, c = samples.shape # (b, s*dancer_num, c-4(147))
-        pos = samples[:, :, :3].to(cond.device)  # (b, s*dancer_num, 3) | np.zeros((sample.shape[0], 3))
-        q = samples[:, :, 3:].reshape(b, s, 24, 6) # (b, s*dancer_num, 24, 6)
-        # go 6d to ax
-        q = ax_from_6v(q).to(cond.device) # (b, s*dancer_num, 24, 3)
-
+        pos = samples.to(cond.device)  # (b, s*dancer_num, 3) | np.zeros((sample.shape[0], 3))
 
         if mode == "long": #For testing, outputs concatenated motion data (pos, q). When a full audio clip is input, b denotes the number of audio slices.
-            b, _, c1, c2 = q.shape
             pos = pos.reshape(b, 150, required_dancer_num, -1) # (b, s*dancer_num, 3) -> (b, s, dancer_num, 3)
-            q = q.reshape(b, 150, required_dancer_num, c1, c2) # (b, s*dancer_num, 24, 3) -> (b, s, dancer_num, 24, 3)
             b, s, dn, c1, c2 = q.shape
             assert s % 2 == 0
             half = s // 2
@@ -849,10 +705,8 @@ class GaussianDiffusion(nn.Module):
             if b >= 1: # If there is more than one slice
                 # Concatenate each dancer's motion separately
                 pos_all = torch.tensor([]).to(pos.device)
-                q_all = torch.tensor([]).to(pos.device)
                 for dancer_i in range(dn):
                     cur_pos = pos[:, :, dancer_i, :].reshape(b, 150, -1)    
-                    cur_q = q[:, :, dancer_i, :, :].reshape(b, 150, c1, c2)  
                     # if long mode, stitch position using linear interp
                     fade_out = torch.ones((1, s, 1)).to(cur_pos.device)
                     fade_in = torch.ones((1, s, 1)).to(cur_pos.device)
@@ -873,73 +727,25 @@ class GaussianDiffusion(nn.Module):
                         idx += half
 
                     # stitch joint angles with slerp
-                    slerp_weight = torch.linspace(0, 1, half)[None, :, None].to(cur_pos.device)
-
-                    left, right = cur_q[:-1, half:], cur_q[1:, :half]
-                    # convert to quat
-                    left, right = (
-                        axis_angle_to_quaternion(left),
-                        axis_angle_to_quaternion(right),
-                    )
-                    merged = quat_slerp(left, right, slerp_weight)  # (b-1) x half x ...
-                    # convert back
-                    merged = quaternion_to_axis_angle(merged)
-
-                    full_q = torch.zeros((s + half * (b - 1), c1, c2)).to(cur_pos.device)
-                    full_q[:half] += cur_q[0, :half]
-                    idx = half
-                    for q_slice in merged:
-                        full_q[idx : idx + half] += q_slice
-                        idx += half
-                    full_q[idx : idx + half] += cur_q[-1, half:]
-
                     pos_all = torch.concat([pos_all,full_pos.reshape(-1, 1, 3)],dim = 1) # (b*s, dancer_num, 3)
-                    q_all = torch.concat([q_all,full_q.reshape(-1, 1, 24, 3)],dim = 1) # (b*s, dancer_num, 24, 3)
 
                 # reshape for fk 
                 bs, dn, _ = pos_all.shape
                 full_pos = pos_all.reshape(1, bs*dn, 3) # (b*s, dancer_num, 3) -> (1, b*s, dancer_num, 3)
-                full_q = q_all.reshape(1, bs*dn, 24, 3) # (1, b*s, dancer_num, 24, 3)
 
             else:
                 full_pos = pos
-                full_q = q
 
-            full_q = full_q.reshape(1,-1,24,3)
             full_pos = full_pos.reshape(1,-1,3)
-            full_pose = (
-                self.smpl.forward(full_q, full_pos).detach().cpu().numpy()
-            )  # b, s*dancer_num, 24, 3
+            full_pose = full_pos  # b, s*dancer_num, 22, 3
 
-            # reshape (1, b*s*dancer_num, 24, 3) -> (1, b*s, dancer_num, 24, 3) -> (1, dancer_num, b*s, 24, 3)
+            # reshape (1, b*s*dancer_num, 22, 3) -> (1, b*s, dancer_num, 22, 3) -> (1, dancer_num, b*s, 22, 3)
             
-            full_pose = full_pose.reshape(1, bs, dn, 24, 3)
-            full_pose = np.transpose(full_pose, (0,2,1,3,4)) # (b, s, dancer_num, 24, 3) -> (b, dancer_num, s, 24, 3)
+            full_pose = full_pose.reshape(1, bs, dn, 22, 3)
+            full_pose = np.transpose(full_pose, (0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
 
-            # squeeze the batch dimension away and render
-            skeleton_render(
-                full_pose[0,:,:render_len], # (b, dancer_num, s, 24, 3) -> (dancer_num, s, 24, 3)
-                epoch=f"{epoch}",
-                out=render_out,
-                name=name,
-                sound=sound,
-                stitch=True,
-                sound_folder=sound_folder,
-                render=render
-            )
-            if fk_out is not None: # If None, this branch needs to be executed to save the output FK SMPL data.
-                outname = f'{epoch}_{"_".join(os.path.splitext(os.path.basename(name[0]))[0].split("_")[:-1])}.pkl'
-                Path(fk_out).mkdir(parents=True, exist_ok=True)
-                pickle.dump(
-                    {
-                        "smpl_poses": full_q.squeeze(0).reshape((-1, 72)).cpu().numpy(),
-                        "smpl_trans": full_pos.squeeze(0).cpu().numpy(),
-                        "full_pose": full_pose[0],
-                    },
-                    open(os.path.join(fk_out, outname), "wb"),
-                )
             return
-        poses = self.smpl.forward(q, pos).detach().cpu().numpy() # [2, 450, 24, 3] [2, 3, 3] | (b, s*dancer_num, 24, 3), key points
+        poses = pos.detach().cpu().numpy() # [2, 450, 22, 3] [2, 3, 3] | (b, s*dancer_num, 22, 3), key points
         # permute contact (b, seq, dancer_num, 4) -> (b, dancer_num, seq, 4)
         sample_contact = np.transpose(sample_contact,(0,2,1,3))
 
@@ -950,40 +756,29 @@ class GaussianDiffusion(nn.Module):
         )
 
         b = poses.shape[0]
-        poses = poses.reshape(b,-1,required_dancer_num,24,3)
-        poses = np.transpose(poses,(0,2,1,3,4)) # (b, s, dancer_num, 24, 3) -> (b, dancer_num, s, 24, 3)
+        poses = poses.reshape(b,-1,required_dancer_num,22,3)
+        poses = np.transpose(poses,(0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
+        poses = poses[0]
+        fmotion = poses[0].reshape(150, 66)
+        lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
+        lmotion = lmotion.cpu().detach().numpy()
+        
+        motions = [fmotion, lmotion]
+        output_path = f'{render_out}/videos'
+        os.makedirs(output_path, exist_ok=True)
+        generate_one_sample(motions, name[0], output_path)
 
-        def inner(xx):
-            num, pose = xx
-            filename = name[num] if name is not None else None
-            contact = sample_contact[num] if sample_contact is not None else None
-            skeleton_render(
-                pose,
-                epoch=f"e{epoch}_b{num}",
-                out=render_out,
-                name=filename,
-                sound=sound,
-                contact=contact,
-            )
+        # def inner(xx):
+        #     num, pose = xx
+        #     filename = name[num] if name is not None else None
+        #     contact = sample_contact[num] if sample_contact is not None else None
+        #     skeleton_render(
+        #         pose,
+        #         epoch=f"e{epoch}_b{num}",
+        #         out=render_out,
+        #         name=filename,
+        #         sound=sound,
+        #         contact=contact,
+        #     )
 
-        p_map(inner, enumerate(poses)) # perform render here
-
-        if fk_out is not None and mode != "long": 
-            Path(fk_out).mkdir(parents=True, exist_ok=True)
-            for num, (qq, pos_, filename, pose) in enumerate(zip(q, pos, name, poses)):
-                path = os.path.normpath(filename)
-                pathparts = path.split(os.sep)
-                pathparts[-1] = pathparts[-1].replace("npy", "wav")
-                # path is like "data/train/features/name"
-                pathparts[2] = "wav_sliced"
-                audioname = os.path.join(*pathparts)
-                outname = f"{epoch}_{num}_{pathparts[-1][:-4]}.pkl"
-                pickle.dump(
-                    {
-                        "smpl_poses": qq.reshape((-1, 72)).cpu().numpy(),
-                        "smpl_trans": pos_.cpu().numpy(),
-                        "full_pose": pose,
-                    },
-                    open(f"{fk_out}/{outname}", "wb"),
-                )
-    
+        # p_map(inner, enumerate(poses)) # perform render here
