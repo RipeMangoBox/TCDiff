@@ -23,7 +23,7 @@ def parse_train_opt():
     parser.add_argument("--no_cache", action="store_true", default = False, help="Disable dataset caching; always reload from disk.")
         
     parser.add_argument(
-        "--required_dancer_num", type = int, default=2, help="Number of dancers required in each sample."
+        "--required_dancer_num", type = int, default=1, help="Number of dancers required in each sample."
     )
 
 

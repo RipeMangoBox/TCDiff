@@ -8,7 +8,6 @@ from tqdm import tqdm
 import pickle as pkl
 import numpy as np
 from .scaler import MinMaxScaler
-from .dd100lf_all2 import DD100lfAll2
 from torch.utils.data import DataLoader
 
 def increment_path(path, exist_ok=False, sep="", mkdir=False):
@@ -48,12 +47,11 @@ class Normalizer:
 
 def vectorize_many(data):
     # given a list of batch x seqlen x joints? x channels, flatten all to batch x seqlen x -1, concatenate
-    batch_size = data[0].shape[0]
-    seq_len = data[0].shape[1]
+    seq_len = data.shape[1]
 
-    out = [x.reshape(batch_size, seq_len, -1).contiguous() for x in data]
+    out = [x.reshape(seq_len, -1).contiguous() for x in data]
 
-    global_pose_vec_gt = torch.cat(out, dim=2)
+    global_pose_vec_gt = torch.cat(out, dim=0)
     return global_pose_vec_gt
 
 

@@ -7,22 +7,21 @@ import numpy as np
 from intergen_vis import generate_one_sample
 from easydict import EasyDict
 
-
-def batch_data_process(batch_data):
+def batch_data_process(batch_data, normalizer = None, device = None):
     name, music, lmotion, fmotion, motion_lens = batch_data
 
     batch = OrderedDict({})
     batch["wavnames"] = name
-    batch["fmotion"] = fmotion
-    batch["lmotion"] = lmotion
-    batch["music"] = music
+    if normalizer is not None:
+        batch["fmotion"] = normalizer.normalize(fmotion.to(device))
+        batch["lmotion"] = normalizer.normalize(lmotion.to(device))
+    else:
+        batch["fmotion"] = fmotion.to(device)
+        batch["lmotion"] = lmotion.to(device)
+    batch["music"] = music.to(device)
     return batch
 
-def motion_process_backward(lmotion, fmotion, duration=None, motion_normalizer=None):
-    if motion_normalizer is not None:
-        lmotion = motion_normalizer.backward(lmotion)[:, :duration, :22*3]
-        fmotion = motion_normalizer.backward(fmotion)[:, :duration, :22*3]
-    
+def motion_process_backward(lmotion, fmotion, duration=None):
     lmotion = lmotion.cpu().data.numpy()
     fmotion = fmotion.cpu().data.numpy()
     return lmotion[0], fmotion[0]
@@ -90,7 +89,7 @@ def calc_duet_joints_vq(model, device, test_dl, mask):
         leaders = []
         fnames = []
         for i, batch_data in enumerate(tqdm(test_dl, desc=f'[*] calc_duet_joints')):
-            batch = batch_data_process(batch_data)
+            batch = batch_data_process(batch_data, normalizer=None)
             gt_motion = batch['fmotion'][..., mask]
             pred_motion, loss_commit, perplexity = model(gt_motion).values()
             
@@ -114,7 +113,7 @@ def calc_duet_joints_vq_full(upper_model, lower_model, device, test_dl, upper_ma
         leaders = []
         fnames = []
         for i, batch_data in enumerate(tqdm(test_dl, desc=f'[*] calc_duet_joints')):
-            batch = batch_data_process(batch_data)
+            batch = batch_data_process(batch_data, normalizer=None)
             gt_upper_motion = batch['fmotion'][..., upper_mask]
             gt_lower_motion = batch['fmotion'][..., lower_mask]
             pred_upper_motion, loss_commit, perplexity = upper_model(gt_upper_motion).values()
@@ -140,7 +139,7 @@ def eval_during_training(model, duet_metric_calc, device, test_dl, mask, writer,
         logger.info(f'Eval. Iter {global_step} : {key} {value:.2f}')
     return duet_metrics
 
-def synthesis_and_vis_vq(epoch, expdir, model, device, val_dl, test_dl, mask):
+def synthesis_and_vis_vq(epoch, expdir, model, device, val_dl, test_dl, mask, normalizer=None):
     def synthesis_and_vis_one_sample(model, epoch, dataset, dataset_name, device, sample_num, seq_len):
         # 对test_dl中第0下标的数据进行合成和可视化
         device = device
@@ -151,7 +150,7 @@ def synthesis_and_vis_vq(epoch, expdir, model, device, val_dl, test_dl, mask):
                 name, text, motion1, motion2, motion_lens = batch_data
                 fname = name[0] if isinstance(name, (list, tuple)) else str(name)
                 
-                batch = batch_data_process(batch_data)
+                batch = batch_data_process(batch_data, normalizer)
                 gt_motion = batch['fmotion'][..., mask]
                 pred_motion, loss_commit, perplexity = model(gt_motion).values()
                 fmotion = batch['fmotion']
@@ -172,8 +171,8 @@ def synthesis_and_vis_vq(epoch, expdir, model, device, val_dl, test_dl, mask):
                 
                 if i >= sample_num:
                     break
-    synthesis_and_vis_one_sample(model, epoch, val_dl, 'val', device, sample_num=2, seq_len=300)
-    synthesis_and_vis_one_sample(model, epoch, test_dl, 'test', device, sample_num=1, seq_len=450)
+    synthesis_and_vis_one_sample(model, epoch, val_dl, 'val', device, sample_num=2, seq_len=300, normalizer=normalizer)
+    synthesis_and_vis_one_sample(model, epoch, test_dl, 'test', device, sample_num=1, seq_len=450, normalizer=normalizer)
         
 
 def synthesis_and_vis_vq_full(expdir, upper_model, lower_model, device, val_dl, test_dl, upper_mask, lower_mask):
@@ -214,7 +213,7 @@ def synthesis_and_vis_vq_full(expdir, upper_model, lower_model, device, val_dl, 
     synthesis_and_vis_one_sample(upper_model, lower_model, val_dl, 'val', device, sample_num=2, seq_len=128)
     synthesis_and_vis_one_sample(upper_model, lower_model, test_dl, 'test', device, sample_num=1, seq_len=600)
         
-def synthesis(result_dir, model, device, test_dl, mask):
+def synthesis(result_dir, model, device, test_dl, mask, normalizer=None):
     def synthesis_and_vis(seqlen):
         # 对test_dl中第0下标的数据进行合成和可视化
         device = device
@@ -233,7 +232,7 @@ def synthesis(result_dir, model, device, test_dl, mask):
                 name, text, motion1, motion2, motion_lens = batch_data
                 fname = name[0] if isinstance(name, (list, tuple)) else str(name)
                 
-                batch = batch_data_process(batch_data)
+                batch = batch_data_process(batch_data, normalizer)
                 output = model.forward_test(batch)['output']
                 B, T, D = output.shape
                 lmotion_output, fmotion_output = torch.split(output, [D//2, D//2], dim=-1)
@@ -245,8 +244,8 @@ def synthesis(result_dir, model, device, test_dl, mask):
                 motion_both = [lpos, fpos]
                 generate_one_sample(motion_both, f"{fname}", video_dir)
                 
-    synthesis_and_vis(seqlen=128)
-    synthesis_and_vis(seqlen=None)
+    synthesis_and_vis(seqlen=128, normalizer=normalizer)
+    synthesis_and_vis(seqlen=None, normalizer=normalizer)
         
 def save_pos3d(posf, posl, evaldir, fname, suffix='pos3d_npy'):
     save_folder = os.path.join(evaldir, suffix)

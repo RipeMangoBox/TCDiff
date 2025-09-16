@@ -19,6 +19,7 @@ from model.adan import Adan
 from model.diffusion import GaussianDiffusion
 from model.model import DanceDecoder
 from vis import SMPLSkeleton
+from dataset.dd100lf_all2 import DD100lfAll2
 
 ## train model
 from TrajDecoder.model.traj_model import *
@@ -26,7 +27,7 @@ from TrajDecoder.dataset.traj_dataset import *
 from TrajDecoder.vis import render_sample as render_traj_sample
 import TrajDecoder.options.option_traj as option_traj 
 from TrajDecoder.utils.utils_model import kalman_smooth_batch
-from rd_process import batch_data_process, DD100lf_dl
+from rd_process import batch_data_process
     
 # To resolve CUDA errors, execute unset LD_LIBRARY_PATH. See this blog post for more information. https://blog.csdn.net/BetrayFree/article/details/133868929
 
@@ -42,13 +43,12 @@ class TCDiff:
     def __init__(
         self,
         checkpoint_path="",
-        normalizer=None,
         EMA=True,
         learning_rate=4e-4,
         weight_decay=0.02,
         required_dancer_num = 3, 
         window_size = 150,
-        split_file = None,
+        opt = None,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
         self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
@@ -61,11 +61,34 @@ class TCDiff:
 
         self.repr_dim = repr_dim
         self.required_dancer_num = required_dancer_num
-        self.split_file = split_file
-        feature_dim = 54 # music feature dim
+        feature_dim = 4800 # music feature dim
         self.horizon = horizon = window_size
         self.accelerator.wait_for_everyone()
 
+        # load datasets
+        train_tensor_dataset_path = os.path.join(
+            opt.processed_data_dir, f"train_tensor_dataset.pkl"
+        )
+        test_tensor_dataset_path = os.path.join(
+            opt.processed_data_dir, f"test_tensor_dataset.pkl"
+        )
+        if (
+            not opt.no_cache
+            and os.path.isfile(train_tensor_dataset_path)
+            and os.path.isfile(test_tensor_dataset_path)
+        ):
+            self.train_dataset = pickle.load(open(train_tensor_dataset_path, "rb"))
+            self.test_dataset = pickle.load(open(test_tensor_dataset_path, "rb"))
+        else:
+            self.train_dataset = DD100lfAll2(
+                split='train', full_length=False
+            )
+            self.test_dataset = DD100lfAll2(
+                split='test', full_length=False, normalizer=self.train_dataset.normalizer
+            )
+
+        self.normalizer = self.train_dataset.normalizer
+        
         checkpoint = None
         if checkpoint_path != "":
             checkpoint = torch.load(
@@ -97,6 +120,7 @@ class TCDiff:
             use_p2=False,
             cond_drop_prob=0.25,
             guidance_weight=2,
+            normalizer=self.normalizer,
         )
 
         print(
@@ -127,16 +151,35 @@ class TCDiff:
     def prepare(self, objects):
         return self.accelerator.prepare(*objects)
 
-    def train_loop(self, opt, train_dataloader, test_dataloader): 
-        train_data_loader = self.accelerator.prepare(train_dataloader)
-        test_data_loader = self.accelerator.prepare(test_dataloader)
-        self.normalizer = train_dataloader.dataset.normalizer
+    def train_loop(self, opt): 
+        num_cpus = multiprocessing.cpu_count()
+        train_data_loader = DataLoader(
+            self.train_dataset,
+            batch_size=opt.batch_size,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=True,
+        )
+        test_data_loader = DataLoader(
+            self.test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=True,
+        )
+        
+        self.train_data_loader = self.accelerator.prepare(train_data_loader)
+        self.test_data_loader = self.accelerator.prepare(test_data_loader)
+        self.normalizer = self.train_data_loader.dataset.normalizer
         
         # --- No changes needed here ---
         if self.accelerator.is_main_process:
             save_dir = str(increment_path(Path(opt.project) / opt.exp_name))
             opt.exp_name = save_dir.split("/")[-1]
             save_dir = Path(save_dir)
+            self.save_dir = save_dir
             wdir = save_dir / "weights"
             wdir.mkdir(parents=True, exist_ok=True)
             self.writer = SummaryWriter(os.path.join(wdir, "tensorboard"))
@@ -160,9 +203,9 @@ class TCDiff:
                 # Calculate a global step for a continuous x-axis in TensorBoard
                 global_step = (epoch - 1) * len(train_data_loader) + step
 
-                batch_data = batch_data_process(batch)
+                batch_data = batch_data_process(batch, self.normalizer, device=self.accelerator.device)
                 x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
-                x = torch.stack([x, lmotion], dim=1)
+                x = x.unsqueeze(1)
                 total_loss, (loss, v_loss, foot_loss) = self.diffusion( 
                     x, lmotion, music, t_override=None 
                 )
@@ -223,23 +266,26 @@ class TCDiff:
                     
                     # generate a sample
                     render_count = 1
-                    shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
+                    shape = (render_count, self.horizon, self.repr_dim)
                     print("Generating Sample")
                     # draw a cond from the test dataset
-                    batch_data = batch_data_process(next(iter(test_data_loader)))
-                    x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
-                    x = torch.stack([x, lmotion], dim=1)
+                    batch_data = batch_data_process(next(iter(self.test_data_loader)), self.normalizer, device=self.accelerator.device)
+                    fmotion, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+                    x = fmotion.unsqueeze(1)
                     
-                    x = x.to(self.accelerator.device) 
+                    # x_traj_xy = x[:,0,:,[4,4+1]] # [*, 150, 2]
+                    # l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
+                    # bs, seq, c = x_traj_xy.shape
+                    # x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
+                    # x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
+                    # x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
+                    
                     x_traj_xy = x[:,0,:,[4,4+1]] # [*, 150, 2]
-                    l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
+                    # l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
                     bs, seq, c = x_traj_xy.shape
-                    x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
+                    x_traj = torch.zeros(bs, 1, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
                     x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
-                    x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
-
-                    music = music.to(self.accelerator.device) # [*, 301, 438]
-                    lmotion = lmotion.to(self.accelerator.device)
+                    # x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
 
                     self.diffusion.render_sample( 
                         shape,
@@ -247,7 +293,7 @@ class TCDiff:
                         music,
                         self.normalizer,
                         epoch,
-                        os.path.join(opt.render_dir, "train_" + opt.exp_name),
+                        os.path.join(self.save_dir, "renders"),
                         name=wavnames,
                         sound=True,
                         required_dancer_num = self.required_dancer_num,
@@ -259,290 +305,276 @@ class TCDiff:
             self.writer.close()
 
 
-    def given_trajectory_generation_loop(self, opt, train_dataloader, test_dataloader): 
-        train_data_loader = self.accelerator.prepare(train_dataloader)
-        test_data_loader = self.accelerator.prepare(test_dataloader)
-        self.normalizer = train_dataloader.dataset.normalizer
+    # def given_trajectory_generation_loop(self, opt): 
+    #     self.train_data_loader = self.accelerator.prepare(self.train_data_loader)
+    #     self.test_data_loader = self.accelerator.prepare(self.test_data_loader)
+    #     self.normalizer = self.train_data_loader.dataset.normalizer
         
-        # boot up multi-gpu training. test dataloader is only on main process
-        load_loop = (
-            partial(tqdm, position=1, desc="Batch"),
-            lambda x: x
-        )
+    #     # boot up multi-gpu training. test dataloader is only on main process
+    #     load_loop = (
+    #         partial(tqdm, position=1, desc="Batch"),
+    #         lambda x: x
+    #     )
 
-        render_count = 30 
-        shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
+    #     render_count = 30 
+    #     shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
         
-        print("Begin validation with given trajectories")
-        self.eval()
-        for epoch in range(1, opt.epochs + 1):
-            # draw a cond from the test dataset
-            batch_data = batch_data_process(next(iter(train_data_loader)))
-            x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
-            print("Generating Sample")
-            x = x.cuda()
-            x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
-            l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
-            bs, seq, c = x_traj_xy.shape
-            x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
-            x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
-            x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
-            music = music.to(x) # [*, 301, 438]
-            lmotion = lmotion.to(x)
+    #     print("Begin validation with given trajectories")
+    #     self.eval()
+    #     for epoch in range(1, opt.epochs + 1):
+    #         # draw a cond from the test dataset
+    #         batch_data = batch_data_process(next(iter(self.train_data_loader)), self.normalizer, device=self.accelerator.device)
+    #         x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+    #         print("Generating Sample")
+    #         x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
+    #         l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
+    #         bs, seq, c = x_traj_xy.shape
+    #         x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
+    #         x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
+    #         x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
 
-            self.diffusion.render_sample( 
-                shape,
-                music[:render_count],
-                lmotion[:render_count],
-                self.normalizer,
-                epoch,
-                os.path.join(opt.render_dir, "Given_Train_" + opt.exp_name),
-                name=wavnames[:render_count],
-                sound=True,
-                required_dancer_num= self.required_dancer_num,
-                x_0 = x_traj[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), 
-            )
-            print(f"[TRAIN-RENDER SAVED at Epoch {epoch}]")
+    #         self.diffusion.render_sample( 
+    #             shape,
+    #             music[:render_count],
+    #             lmotion[:render_count],
+    #             self.normalizer,
+    #             epoch,
+    #             os.path.join(opt.render_dir, "Given_Train_" + opt.exp_name),
+    #             name=wavnames[:render_count],
+    #             sound=True,
+    #             required_dancer_num= self.required_dancer_num,
+    #             x_0 = x_traj[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), 
+    #         )
+    #         print(f"[TRAIN-RENDER SAVED at Epoch {epoch}]")
 
             
-            shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
-            print("Generating Sample")
-            # draw a cond from the test dataset
-            batch_data = batch_data_process(next(iter(test_data_loader)))
-            x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+    #         shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
+    #         print("Generating Sample")
+    #         # draw a cond from the test dataset
+    #         batch_data = batch_data_process(next(iter(self.test_data_loader)), self.normalizer, device=self.accelerator.device)
+    #         x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
 
-            x = x.cuda() # [*, dn, 150, 70] [bs, 3, 150, 70]
-            x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
-            l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
-            bs, seq, c = x_traj_xy.shape
-            x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
-            x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
-            x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
+    #         x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
+    #         l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
+    #         bs, seq, c = x_traj_xy.shape
+    #         x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
+    #         x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
+    #         x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
 
-            music = music.to(x) # [*, 301, 438]
-            lmotion = lmotion.to(x)
-            self.diffusion.render_sample( 
-                shape,
-                music[:render_count],
-                lmotion[:render_count],
-                self.normalizer,
-                epoch,
-                os.path.join(opt.render_dir, "Given_Test_" + opt.exp_name),
-                name=wavnames[:render_count],
-                sound=True,
-                required_dancer_num= self.required_dancer_num,
-                x_0 = x_traj[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), # [2, seq, 3, 2] 
-            )
-            print(f"[VAL-RENDER SAVED at Epoch {epoch}]")
+    #         self.diffusion.render_sample( 
+    #             shape,
+    #             music[:render_count],
+    #             lmotion[:render_count],
+    #             self.normalizer,
+    #             epoch,
+    #             os.path.join(opt.render_dir, "Given_Test_" + opt.exp_name),
+    #             name=wavnames[:render_count],
+    #             sound=True,
+    #             required_dancer_num= self.required_dancer_num,
+    #             x_0 = x_traj[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), # [2, seq, 3, 2] 
+    #         )
+    #         print(f"[VAL-RENDER SAVED at Epoch {epoch}]")
 
 
-    def test_loop(self, opt): 
-        train_tensor_dataset_path = os.path.join(
-            opt.processed_data_dir, f"train_tensor_dataset.pkl"
-        )
-        test_tensor_dataset_path = os.path.join(
-            opt.processed_data_dir, f"test_tensor_dataset.pkl"
-        )
-        if (
-            not opt.no_cache
-            and os.path.isfile(train_tensor_dataset_path) 
-            and os.path.isfile(test_tensor_dataset_path)
-        ):
-            train_dataset = pickle.load(open(train_tensor_dataset_path, "rb"))
-            test_dataset = pickle.load(open(test_tensor_dataset_path, "rb"))
-        else:
-            train_dataset = AIOZDataset(
-                data_path=opt.data_path,
-                backup_path=opt.processed_data_dir,
-                train=True,
-                force_reload=opt.force_reload,
-                required_dancer_num = self.required_dancer_num, 
-                split_file = self.split_file,
-            )
-            test_dataset = AIOZDataset(
-                data_path=opt.data_path,
-                backup_path=opt.processed_data_dir,
-                train=False,
-                normalizer=train_dataset.normalizer,
-                force_reload=opt.force_reload,
-                required_dancer_num = self.required_dancer_num, 
-                split_file = self.split_file,
-            )
-            # cache the dataset in case
-            pickle.dump(train_dataset, open(train_tensor_dataset_path, "wb"))
-            pickle.dump(test_dataset, open(test_tensor_dataset_path, "wb"))
+    # def test_loop(self, opt): 
+    #     train_tensor_dataset_path = os.path.join(
+    #         opt.processed_data_dir, f"train_tensor_dataset.pkl"
+    #     )
+    #     test_tensor_dataset_path = os.path.join(
+    #         opt.processed_data_dir, f"test_tensor_dataset.pkl"
+    #     )
+    #     if (
+    #         not opt.no_cache
+    #         and os.path.isfile(train_tensor_dataset_path) 
+    #         and os.path.isfile(test_tensor_dataset_path)
+    #     ):
+    #         train_dataset = pickle.load(open(train_tensor_dataset_path, "rb"))
+    #         test_dataset = pickle.load(open(test_tensor_dataset_path, "rb"))
+    #     else:
+    #         train_dataset = AIOZDataset(
+    #             data_path=opt.data_path,
+    #             backup_path=opt.processed_data_dir,
+    #             train=True,
+    #             force_reload=opt.force_reload,
+    #             required_dancer_num = self.required_dancer_num, 
+    #         )
+    #         test_dataset = AIOZDataset(
+    #             data_path=opt.data_path,
+    #             backup_path=opt.processed_data_dir,
+    #             train=False,
+    #             normalizer=train_dataset.normalizer,
+    #             force_reload=opt.force_reload,
+    #             required_dancer_num = self.required_dancer_num, 
+    #         )
+    #         # cache the dataset in case
+    #         pickle.dump(train_dataset, open(train_tensor_dataset_path, "wb"))
+    #         pickle.dump(test_dataset, open(test_tensor_dataset_path, "wb"))
 
-        # set normalizer
-        self.normalizer = test_dataset.normalizer
+    #     # set normalizer
+    #     self.normalizer = test_dataset.normalizer
 
-        # data loaders
-        # decide number of workers based on cpu count
-        num_cpus = multiprocessing.cpu_count()
-        train_data_loader = DataLoader(
-            train_dataset,
-            batch_size=opt.batch_size,
-            shuffle=True,
-            num_workers=min(int(num_cpus * 0.75), 32),
-            pin_memory=True,
-            drop_last=True,
-        )
-        test_data_loader = DataLoader(
-            test_dataset,
-            batch_size=opt.batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True,
-            drop_last=True,
-        )
+    #     # data loaders
+    #     # decide number of workers based on cpu count
+    #     num_cpus = multiprocessing.cpu_count()
+    #     train_data_loader = DataLoader(
+    #         train_dataset,
+    #         batch_size=opt.batch_size,
+    #         shuffle=True,
+    #         num_workers=min(int(num_cpus * 0.75), 32),
+    #         pin_memory=True,
+    #         drop_last=True,
+    #     )
+    #     test_data_loader = DataLoader(
+    #         test_dataset,
+    #         batch_size=opt.batch_size,
+    #         shuffle=True,
+    #         num_workers=2,
+    #         pin_memory=True,
+    #         drop_last=True,
+    #     )
 
-        # boot up multi-gpu training. test dataloader is only on main process
-        load_loop = (
-            partial(tqdm, position=1, desc="Batch"),
-            lambda x: x
-        )
+    #     # boot up multi-gpu training. test dataloader is only on main process
+    #     load_loop = (
+    #         partial(tqdm, position=1, desc="Batch"),
+    #         lambda x: x
+    #     )
 
-        render_count = 30 
-        shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
+    #     render_count = 30 
+    #     shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
 
-        ## init Trajectory Model
-        trjm_args = option_traj.get_args_parser()
-        torch.manual_seed(trjm_args.seed)
-        window_size = trjm_args.window_size # align with training
-        step = trjm_args.step
-        traj_model = TrajDecoder(nfeats = trjm_args.nfeats, 
-                  trans_layer = trjm_args.trans_layer, 
-                  window_size = trjm_args.window_size,
-                  ) 
-        if trjm_args.checkpoint is not None:
-            ckpt = torch.load(opt.traj_checkpoint, map_location='cpu')
-            traj_model.load_state_dict(ckpt['net'], strict=True) 
-            print('loading checkpoint from {}'.format(opt.traj_checkpoint))
-        traj_model.cuda().eval()
+    #     ## init Trajectory Model
+    #     trjm_args = option_traj.get_args_parser()
+    #     torch.manual_seed(trjm_args.seed)
+    #     window_size = trjm_args.window_size # align with training
+    #     step = trjm_args.step
+    #     traj_model = TrajDecoder(nfeats = trjm_args.nfeats, 
+    #               trans_layer = trjm_args.trans_layer, 
+    #               window_size = trjm_args.window_size,
+    #               ) 
+    #     if trjm_args.checkpoint is not None:
+    #         ckpt = torch.load(opt.traj_checkpoint, map_location='cpu')
+    #         traj_model.load_state_dict(ckpt['net'], strict=True) 
+    #         print('loading checkpoint from {}'.format(opt.traj_checkpoint))
+    #     traj_model.cuda().eval()
         
-        print("Begin testing with generated trajectories")
-        self.eval()
-        for epoch in range(1, opt.epochs + 1):
-            # draw a cond from the test dataset
-            batch_data = batch_data_process(next(iter(train_data_loader)))
-            x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
-            x = torch.stack([x, lmotion], dim=1)
-            print("Generating Sample")
-            x = x.cuda()
-            lmotion = lmotion.to(x)
-            music = music.to(x) 
+    #     print("Begin testing with generated trajectories")
+    #     self.eval()
+    #     for epoch in range(1, opt.epochs + 1):
+    #         # draw a cond from the test dataset
+    #         batch_data = batch_data_process(next(iter(self.train_data_loader)), self.normalizer, device=self.accelerator.device)
+    #         x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+    #         x = x.unsqueeze(1)
+    #         print("Generating Sample")
 
-            # Autoregressively generate the full trajectory sequence
-            pre_list = []
+    #         # Autoregressively generate the full trajectory sequence
+    #         pre_list = []
 
-            # Extract initial xy trajectory from input data
-            x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
-            l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
-            bs, seq, c = x_traj_xy.shape
-            x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
-            x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
-            x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
+    #         # Extract initial xy trajectory from input data
+    #         x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
+    #         l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
+    #         bs, seq, c = x_traj_xy.shape
+    #         x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
+    #         x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
+    #         x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
 
-            # Initialize the first window for trajectory prediction
-            cond_traj = x_traj[:, :,:window_size,[0,1]] 
-            pre_list.append(cond_traj) 
-            cond_len = music.shape[1]
+    #         # Initialize the first window for trajectory prediction
+    #         cond_traj = x_traj[:, :,:window_size,[0,1]] 
+    #         pre_list.append(cond_traj) 
+    #         cond_len = music.shape[1]
 
-            # Slide a window over the cond features
-            # cond sequence length is (window_size + step) * 2 because cond FPS is twice the motion FPS
-            # Hence, move the cond window by step*2 each time
-            for start in range(0, cond_len + 1-(window_size+step)*2, step*2):  
-                # Predict the next trajectory segment
-                pre_traj = traj_model(cond_traj, music[ :, start:start + (window_size+step) * 2], lmotion[ :, start:start + (window_size+step) * 2]) 
-                cond_traj = pre_traj
-                pre_list.append(pre_traj[:,:,-step:])
+    #         # Slide a window over the cond features
+    #         # cond sequence length is (window_size + step) * 2 because cond FPS is twice the motion FPS
+    #         # Hence, move the cond window by step*2 each time
+    #         for start in range(0, cond_len + 1-(window_size+step)*2, step*2):  
+    #             # Predict the next trajectory segment
+    #             pre_traj = traj_model(cond_traj, music[ :, start:start + (window_size+step) * 2], lmotion[ :, start:start + (window_size+step) * 2]) 
+    #             cond_traj = pre_traj
+    #             pre_list.append(pre_traj[:,:,-step:])
             
-            # Concatenate all trajectory segments into a single sequence
-            x_traj = torch.cat(pre_list,dim = 2) 
+    #         # Concatenate all trajectory segments into a single sequence
+    #         x_traj = torch.cat(pre_list,dim = 2) 
 
-            # Optional: process trajectory with smoothing or constraints
-            x_traj = kalman_smooth_batch(x_traj.cpu().detach().numpy())
-            x_traj = torch.from_numpy(x_traj).to(dtype=x.dtype, device=x.device)
+    #         # Optional: process trajectory with smoothing or constraints
+    #         x_traj = kalman_smooth_batch(x_traj.cpu().detach().numpy())
+    #         x_traj = torch.from_numpy(x_traj).to(dtype=x.dtype, device=x.device)
             
-            # Pad the trajectory to 3D space by adding a zero z-coordinate
-            bs, dn, seq, c = x_traj.shape
-            x_traj_padding = torch.zeros(bs, dn, seq, 3).to(x_traj)
-            x_traj_padding[:,:,:,[0,1]] = x_traj[:,:,:,[0,1]] 
+    #         # Pad the trajectory to 3D space by adding a zero z-coordinate
+    #         bs, dn, seq, c = x_traj.shape
+    #         x_traj_padding = torch.zeros(bs, dn, seq, 3).to(x_traj)
+    #         x_traj_padding[:,:,:,[0,1]] = x_traj[:,:,:,[0,1]] 
 
-            self.diffusion.render_sample( 
-                shape,
-                music[:render_count],
-                lmotion[:render_count],
-                self.normalizer,
-                epoch,
-                os.path.join(opt.render_dir, "TRAIN_" + opt.exp_name),
-                name=wavnames[:render_count],
-                sound=True,
-                required_dancer_num= self.required_dancer_num,
-                x_0 = x_traj_padding[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), 
-            )
-            print(f"[TRAIN-RENDER SAVED at Epoch {epoch}]")
+    #         self.diffusion.render_sample( 
+    #             shape,
+    #             music[:render_count],
+    #             lmotion[:render_count],
+    #             self.normalizer,
+    #             epoch,
+    #             os.path.join(opt.render_dir, "TRAIN_" + opt.exp_name),
+    #             name=wavnames[:render_count],
+    #             sound=True,
+    #             required_dancer_num= self.required_dancer_num,
+    #             x_0 = x_traj_padding[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), 
+    #         )
+    #         print(f"[TRAIN-RENDER SAVED at Epoch {epoch}]")
 
             
-            shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
-            print("Generating Sample")
-            # draw a cond from the test dataset
-            batch_data = batch_data_process(next(iter(test_data_loader)))
-            x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
-            x = torch.stack([x, lmotion], dim=1)
-            x = x.cuda() 
-            lmotion = lmotion.cuda()
-            music = music.cuda()
+    #         shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
+    #         print("Generating Sample")
+    #         # draw a cond from the test dataset
+    #         batch_data = batch_data_process(next(iter(self.test_data_loader)), self.normalizer, device=self.accelerator.device)
+    #         x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+    #         x = x.unsqueeze(1)
 
-            # Autoregressively generate the full trajectory sequence
-            pre_list = []
+    #         # Autoregressively generate the full trajectory sequence
+    #         pre_list = []
 
-            # Extract initial xy trajectory from input data
-            x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
-            l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
-            bs, seq, c = x_traj_xy.shape
-            x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
-            x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
-            x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
+    #         # Extract initial xy trajectory from input data
+    #         x_traj_xy = x[:,:,[4,4+1]] # [*, 150, 2]
+    #         l_traj_xy = lmotion[:,:,[4,4+1]] # [*, 150, 2]
+    #         bs, seq, c = x_traj_xy.shape
+    #         x_traj = torch.zeros(bs, 2, seq, 3).to(x_traj_xy) # Note: Due to some historical baggage, we kept the option to input full xyz coordinates...
+    #         x_traj[:,0,:,[0,1]] = x_traj_xy[:,:,[0,1]] 
+    #         x_traj[:,1,:,[0,1]] = l_traj_xy[:,:,[0,1]] 
 
-            # Initialize the first window for trajectory prediction
-            cond_traj = x_traj[:, :,:window_size,[0,1]] 
-            pre_list.append(cond_traj) 
-            cond_len = music.shape[1]
+    #         # Initialize the first window for trajectory prediction
+    #         cond_traj = x_traj[:, :,:window_size,[0,1]] 
+    #         pre_list.append(cond_traj) 
+    #         cond_len = music.shape[1]
 
-            # Slide a window over the cond features
-            # cond sequence length is (window_size + step) * 2 because cond FPS is twice the motion FPS
-            # Hence, move the cond window by step*2 each time
-            for start in range(0, cond_len + 1-(window_size+step)*2, step*2):  
-                # Predict the next trajectory segment
-                pre_traj = traj_model(cond_traj, music[ :, start:start + (window_size+step) * 2], lmotion[ :, start:start + (window_size+step) * 2]) 
-                cond_traj = pre_traj
-                pre_list.append(pre_traj[:,:,-step:])
+    #         # Slide a window over the cond features
+    #         # cond sequence length is (window_size + step) * 2 because cond FPS is twice the motion FPS
+    #         # Hence, move the cond window by step*2 each time
+    #         for start in range(0, cond_len + 1-(window_size+step)*2, step*2):  
+    #             # Predict the next trajectory segment
+    #             pre_traj = traj_model(cond_traj, music[ :, start:start + (window_size+step) * 2], lmotion[ :, start:start + (window_size+step) * 2]) 
+    #             cond_traj = pre_traj
+    #             pre_list.append(pre_traj[:,:,-step:])
             
-            # Concatenate all trajectory segments into a single sequence
-            x_traj = torch.cat(pre_list,dim = 2) 
+    #         # Concatenate all trajectory segments into a single sequence
+    #         x_traj = torch.cat(pre_list,dim = 2) 
 
-            # Optional: process trajectory with smoothing or constraints
-            x_traj = kalman_smooth_batch(x_traj.cpu().detach().numpy())
-            x_traj = torch.from_numpy(x_traj).to(dtype=x.dtype, device=x.device)
+    #         # Optional: process trajectory with smoothing or constraints
+    #         x_traj = kalman_smooth_batch(x_traj.cpu().detach().numpy())
+    #         x_traj = torch.from_numpy(x_traj).to(dtype=x.dtype, device=x.device)
 
-            # Pad the trajectory to 3D space by adding a zero z-coordinate
-            bs, dn, seq, c = x_traj.shape
-            x_traj_padding = torch.zeros(bs, dn, seq, 3).to(x_traj)
-            x_traj_padding[:,:,:,[0,1]] = x_traj[:,:,:,[0,1]] 
+    #         # Pad the trajectory to 3D space by adding a zero z-coordinate
+    #         bs, dn, seq, c = x_traj.shape
+    #         x_traj_padding = torch.zeros(bs, dn, seq, 3).to(x_traj)
+    #         x_traj_padding[:,:,:,[0,1]] = x_traj[:,:,:,[0,1]] 
 
-            self.diffusion.render_sample( 
-                shape,
-                music[:render_count],
-                lmotion[:render_count],
-                self.normalizer,
-                epoch,
-                os.path.join(opt.render_dir, "TEST_" + opt.exp_name),
-                name=wavnames[:render_count],
-                sound=True,
-                required_dancer_num= self.required_dancer_num,
-                x_0 = x_traj_padding[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), # [2, seq, 3, 2] 
-            )
-            print(f"[TEST-RENDER SAVED at Epoch {epoch}]")
+    #         self.diffusion.render_sample( 
+    #             shape,
+    #             music[:render_count],
+    #             lmotion[:render_count],
+    #             self.normalizer,
+    #             epoch,
+    #             os.path.join(opt.render_dir, "TEST_" + opt.exp_name),
+    #             name=wavnames[:render_count],
+    #             sound=True,
+    #             required_dancer_num= self.required_dancer_num,
+    #             x_0 = x_traj_padding[:render_count].permute(0,2,1,3).reshape(render_count,shape[1], 3), # [2, seq, 3, 2] 
+    #         )
+    #         print(f"[TEST-RENDER SAVED at Epoch {epoch}]")
 
 
 
@@ -559,8 +591,6 @@ class TCDiff:
         #   - sequence length: horizon * number of dancers
         #   - feature dimension: representation dimension per frame
         shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
-        music = music.to(self.accelerator.device)
-        lmotion = lmotion.to(self.accelerator.device)
         self.diffusion.render_sample(
             shape,
             music[:render_count],

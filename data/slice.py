@@ -32,7 +32,6 @@ def slice_motion(motion_file, stride, length, num_slices, out_dir):
     scale = motion["scale"][0]
 
     file_name = os.path.splitext(os.path.basename(motion_file))[0]
-    # normalize root position
     pos /= scale
     start_idx = 0
     window = int(length * 60) 
@@ -76,7 +75,6 @@ def slice_AIOZmotion(motion_file, stride, length, num_slices, out_dir):
     pos, q = motion["pos"], motion["q"] # (dancer_num, seq_len, smpl_pos)
 
     file_name = os.path.splitext(os.path.basename(motion_file))[0]
-    # normalize root position
     start_idx = 0
     window = int(length * 30) 
     stride_step = int(stride * 30)

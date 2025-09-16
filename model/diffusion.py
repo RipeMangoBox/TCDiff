@@ -87,6 +87,7 @@ class GaussianDiffusion(nn.Module):
         use_p2=False,
         cond_drop_prob=0.2,
         seq_len = 150,
+        normalizer = None,
     ):
         super().__init__()
         self.horizon = horizon
@@ -95,7 +96,7 @@ class GaussianDiffusion(nn.Module):
         self.ema = EMA(0.9999)
         self.master_model = copy.deepcopy(self.model)
         self.seq_len = seq_len
-
+        self.normalizer = normalizer
         self.cond_drop_prob = cond_drop_prob
         betas = torch.Tensor(
             make_beta_schedule(schedule=schedule, n_timestep=n_timestep)
@@ -551,6 +552,8 @@ class GaussianDiffusion(nn.Module):
         # it is restored via direct value assignment.
         # The trajectory data is also fed into the modulation module.
         x_noisy[:,:,:,[4,4+1]] = x_start[:,:,:,[4,4+1]]
+        #TODO: no noise is added to leading dancer
+        # x_noisy[:,:,1,[4,4+1]] = x_start[:,:,1,[4,4+1]]
         x_noisy = x_noisy.reshape(bs,sq*dancer_num, c)
 
         # reconstruct
@@ -562,7 +565,9 @@ class GaussianDiffusion(nn.Module):
         else: # this one
             target = x_start
 
-
+        model_out = self.normalizer.unnormalize(model_out)
+        target = self.normalizer.unnormalize(target.view(bs, sq*dancer_num, c))
+        
         # split off contact from the rest
         model_out = model_out.reshape(bs, sq, dancer_num, c) # (bs, sq(150), dancer_num(3), c(70))
         target = target.reshape(bs, sq, dancer_num, c)
@@ -576,7 +581,7 @@ class GaussianDiffusion(nn.Module):
             model_out, (4, model_out.shape[3] - 4), dim=3 # (bs, sq(150), dancer_num(3), 3 + 22*3 == 147)
         )
         target_contact, target = torch.split(target, (4, target.shape[3] - 4), dim=3) # (bs, sq(150), dancer_num(3), 4)
-
+        
         # velocity loss 
         target_v = target[:, 1:] - target[:, :-1]
         model_out_v = model_out[:, 1:] - model_out[:, :-1]
@@ -673,7 +678,45 @@ class GaussianDiffusion(nn.Module):
                 )
                 .detach()
                 .cpu()
-            )
+            )            # for step, batch in enumerate(pbar):
+            #     # Calculate a global step for a continuous x-axis in TensorBoard
+            #     global_step = (epoch - 1) * len(train_data_loader) + step
+
+            #     batch_data = batch_data_process(batch)
+            #     x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+            #     x = torch.stack([x, lmotion], dim=1)
+            #     total_loss, (loss, v_loss, foot_loss) = self.diffusion( 
+            #         x, lmotion, music, t_override=None 
+            #     )
+                
+            #     # --- CHANGE 1: Log each loss individually with add_scalar ---
+            #     if self.accelerator.is_main_process:
+            #         # Update tqdm progress bar
+            #         loss_dict = {
+            #             "loss": loss.item(),
+            #             "v_loss": v_loss.item(),
+            #             "foot_loss": foot_loss.item(),
+            #         }
+            #         pbar.set_postfix(loss_dict)
+                    
+            #         # Log scalars to TensorBoard with a hierarchical tag
+            #         self.writer.add_scalar('train/loss', loss.item(), global_step)
+            #         self.writer.add_scalar('train/v_loss', v_loss.item(), global_step)
+            #         self.writer.add_scalar('train/foot_loss', foot_loss.item(), global_step)
+
+            #     self.optim.zero_grad()
+            #     self.accelerator.backward(total_loss)
+            #     self.optim.step()
+
+            #     if self.accelerator.is_main_process:
+            #         avg_loss += loss.item() # Use .item() to avoid holding onto the graph
+            #         avg_vloss += v_loss.item()
+            #         avg_footloss += foot_loss.item()
+            #         if step % opt.ema_interval == 0:
+            #             self.diffusion.ema.update_model_average(
+            #                 self.diffusion.master_model, self.diffusion.model
+            #             )
+                        
         else:
             samples = shape
 
@@ -760,14 +803,14 @@ class GaussianDiffusion(nn.Module):
         poses = np.transpose(poses,(0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
         poses = poses[0]
         fmotion = poses[0].reshape(150, 66)
-        lmotion = poses[1].reshape(150, 66)
-        # lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
-        # lmotion = lmotion.cpu().detach().numpy()
+        # lmotion = poses[1].reshape(150, 66)
+        lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
+        lmotion = lmotion.cpu().detach().numpy()
         
         motions = [fmotion, lmotion]
-        output_path = f'{render_out}/videos'
+        output_path = render_out
         os.makedirs(output_path, exist_ok=True)
-        generate_one_sample(motions, name[0], output_path)
+        generate_one_sample(motions, f'{name[0]}_e{epoch}', output_path)
 
         # def inner(xx):
         #     num, pose = xx

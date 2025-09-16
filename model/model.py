@@ -465,32 +465,40 @@ class DanceDecoder(nn.Module):
         )
 
         # null embeddings for guidance dropout
-        self.null_cond_embed = nn.Parameter(torch.randn(1, seq_len, latent_dim))
-        self.null_cond_hidden = nn.Parameter(torch.randn(1, latent_dim))
-
         self.norm_cond = nn.LayerNorm(latent_dim)
-
         # input projection
         self.input_projection = nn.Linear(nfeats, latent_dim)
-        self.cond_encoder = nn.Sequential()
-        for _ in range(2):
-            self.cond_encoder.append(
-                TransformerEncoderLayer(
-                    d_model=latent_dim,
-                    nhead=num_heads,
-                    dim_feedforward=ff_size,
-                    dropout=dropout,
-                    activation=activation,
-                    batch_first=True,
-                    rotary=self.rotary,
-                )
-            )
-        # conditional projection
-        # self.cond_projection = nn.Linear(cond_feature_dim, latent_dim)
-        self.cond_projection = nn.Sequential(  # music-condition only, currently
-            nn.Linear(cond_feature_dim, cond_feature_dim),
+        
+        # --- Conditioning Modules ---
+
+        # 1. For Music Condition
+        self.null_cond_embed = nn.Parameter(torch.randn(1, seq_len, latent_dim))
+        self.null_cond_hidden = nn.Parameter(torch.randn(1, latent_dim))
+        self.cond_projection = nn.Sequential(
+            nn.Linear(cond_feature_dim, latent_dim * 2),
             nn.ReLU(),
-            nn.Linear(cond_feature_dim, latent_dim),
+            nn.Linear(latent_dim * 2, latent_dim),
+        )
+        self.cond_encoder = nn.Sequential(
+            *[TransformerEncoderLayer(
+                d_model=latent_dim, nhead=num_heads, dim_feedforward=ff_size,
+                dropout=dropout, activation=activation, batch_first=True, rotary=self.rotary
+            ) for _ in range(2)]
+        )
+
+        # 2. For Leader Motion Condition <--- NEW
+        self.null_lmotion_embed = nn.Parameter(torch.randn(1, seq_len, latent_dim))
+        self.null_lmotion_hidden = nn.Parameter(torch.randn(1, latent_dim))
+        self.lmotion_projection = nn.Sequential(
+            nn.Linear(70, latent_dim * 2),
+            nn.ReLU(),
+            nn.Linear(latent_dim * 2, latent_dim),
+        )
+        self.lmotion_encoder = nn.Sequential(
+             *[TransformerEncoderLayer(
+                d_model=latent_dim, nhead=num_heads, dim_feedforward=ff_size,
+                dropout=dropout, activation=activation, batch_first=True, rotary=self.rotary
+            ) for _ in range(2)]
         )
 
         self.non_attn_cond_projection = nn.Sequential(
@@ -550,69 +558,59 @@ class DanceDecoder(nn.Module):
     ):
         batch_size, device = x.shape[0], x.device
 
-        x = x.reshape(batch_size, -1, 70) 
-        # (b, seq_len*dn, 70)
-
-        # xz offset
-        traj_emb = self.traj_embedding(x[:,1:,[4,4+1]] - x[:,:-1,[4,4+1]])  
-
-        # project to latent space
-        x = self.input_projection(x)  # ([bs, seq_len*dn, nfeats])) -> torch.Size([bs, seq_len*dn, latent])
-        x = self.relative_projection_layer(x.reshape(batch_size, self.seq_len, self.latent_dim*self.required_dancer_num)).reshape(batch_size, self.required_dancer_num*self.seq_len, self.latent_dim)
-        
-        # add the positional embeddings of the input sequence to provide temporal information
+        # --- Process Input x (noisy fmotion) ---
+        # x shape is now (b, seq_len, 70), no need for complex reshaping
+        traj_emb = self.traj_embedding(x[:, 1:, [4, 4+1]] - x[:, :-1, [4, 4+1]])
+        x = self.input_projection(x)
         x = self.abs_pos_encoding(x)
 
-        # create music conditional embedding with conditional dropout
-        keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device) # torch.Size([bs])
-        keep_mask_embed = rearrange(keep_mask, "b -> b 1 1") # torch.Size([bs, 1, 1])
-        keep_mask_hidden = rearrange(keep_mask, "b -> b 1") # torch.Size([bs, 1])
-        c_bs,cond_seq_len,_ = cond_embed.shape # (bs, 301, 438)
+        # --- Classifier-Free Guidance Mask ---
+        keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
+        keep_mask_embed = rearrange(keep_mask, "b -> b 1 1")
+        keep_mask_hidden = rearrange(keep_mask, "b -> b 1")
 
-        cond_tokens = self.cond_projection(cond_embed.float()) # Shape: [bs, seq_len, 876] → [bs, seq_len, 512 (latent_dim)]
-        # Encode tokens
-        cond_tokens = self.abs_pos_encoding(cond_tokens) # Shape: [bs, seq_len, 512]
-        cond_tokens = self.cond_encoder(cond_tokens) # Shape: [bs, seq_len, 512]
-        
-        # Prepare null conditioning embedding.
-        # Randomly drop all cond_embeddings for some batches to encourage the model to rely on other information.
+        # --- 1. Process Music Condition (cond_embed) ---
+        cond_tokens = self.cond_projection(cond_embed.float())
+        cond_tokens = self.abs_pos_encoding(cond_tokens)
+        cond_tokens = self.cond_encoder(cond_tokens)
         null_cond_embed = self.null_cond_embed.to(cond_tokens.dtype)
-        # Shape: [1, seq_len, 512]
-
-        # Replace cond_tokens with null_cond_embed in selected batches.
-        cond_tokens = torch.where(keep_mask_embed, cond_tokens, null_cond_embed) 
-        # Shapes: [bs, 1, 1], [bs, seq_len, 512], [1, seq_len, 512]
+        cond_tokens = torch.where(keep_mask_embed, cond_tokens, null_cond_embed)
         
-        # Aggregate token information via average pooling.
-        mean_pooled_cond_tokens = cond_tokens.mean(dim=-2) 
-        # Shape: [bs, seq_len, 512] → [bs, 512]
+        mean_pooled_cond_tokens = cond_tokens.mean(dim=-2)
+        cond_hidden = self.non_attn_cond_projection(mean_pooled_cond_tokens)
+        null_cond_hidden = self.null_cond_hidden.to(cond_hidden.dtype)
+        cond_hidden = torch.where(keep_mask_hidden, cond_hidden, null_cond_hidden)
 
-        # Project pooled condition features for use in FiLM modulation.
-        cond_hidden = self.non_attn_cond_projection(mean_pooled_cond_tokens) 
-        # Shape: [bs, 512] → [bs, 512]
-
-        # create the diffusion timestep embedding, add the extra music projection
-        t_hidden = self.time_mlp(times) # [*(bs)]->[*(bs), 2048]
-
-        # project to attention and FiLM conditioning
-        t = self.to_time_cond(t_hidden) # [*, 2048] -> [*, 512](t)
-        t_tokens = self.to_time_tokens(t_hidden) # [*, 2048] -> [*(bs), 2, 512]（t_tokens）
-
-        # FiLM conditioning | Performs concatenation of the input t and cond_embedding.
-        # A portion of cond is randomly dropped to encourage the model not to overly rely on it.
-        null_cond_hidden = self.null_cond_hidden.to(t.dtype) # Shape: [1, 512]
-        cond_hidden = torch.where(keep_mask_hidden, cond_hidden, null_cond_hidden) # Replace cond_hidden with null_cond_hidden for some batches,
-                                                                                   # promoting robustness by forcing the model to rely on other information.
-        t += cond_hidden # [2, 512] + [2, 512] → [2, 512]
-
-        # Cross-attention conditioning | Embedding shown in the orange box of Figure 2
-        c = torch.cat((cond_tokens, t_tokens), dim=-2) # [bs, seq_len*dn, 512] con [bs, 2, 512] -> [bs, seq_len*dn + 2, 512]
-        cond_tokens = self.norm_cond(c) # # LayerNorm over concatenated tokens
-
-        # Previously, only input preparation was performed.
-        # Now begin the three DecoderBlocks (corresponding to Figure 2 right structure).
-        # Pass data through the Transformer decoder, attending to conditional embeddings.
-        output = self.seqTransDecoder(x, cond_tokens, t, traj_emb, self.embeddings_table.weight, trj_dist)
+        # --- 2. Process Leader Motion Condition (lmotion) ---  # <--- NEW
+        lmotion_tokens = self.lmotion_projection(lmotion.float())
+        lmotion_tokens = self.abs_pos_encoding(lmotion_tokens)
+        lmotion_tokens = self.lmotion_encoder(lmotion_tokens)
+        null_lmotion_embed = self.null_lmotion_embed.to(lmotion_tokens.dtype)
+        lmotion_tokens = torch.where(keep_mask_embed, lmotion_tokens, null_lmotion_embed)
         
-        output = self.final_layer(output) # -> SMPL 70
+        mean_pooled_lmotion_tokens = lmotion_tokens.mean(dim=-2)
+        lmotion_hidden = self.non_attn_cond_projection(mean_pooled_lmotion_tokens) # Re-use projection
+        null_lmotion_hidden = self.null_lmotion_hidden.to(lmotion_hidden.dtype)
+        lmotion_hidden = torch.where(keep_mask_hidden, lmotion_hidden, null_lmotion_hidden)
+        
+        # --- 3. Process Time Embedding ---
+        t_hidden = self.time_mlp(times)
+        t = self.to_time_cond(t_hidden)
+        t_tokens = self.to_time_tokens(t_hidden)
+
+        # --- 4. Fuse all conditions ---
+        # Fuse for FiLM conditioning by adding all to time embedding
+        t = t + cond_hidden + lmotion_hidden # <--- MODIFIED
+        
+        # Fuse for Cross-Attention conditioning by adding tokens
+        fused_tokens = cond_tokens + lmotion_tokens # <--- MODIFIED
+        
+        c = torch.cat((fused_tokens, t_tokens), dim=-2)
+        final_cond_tokens = self.norm_cond(c)
+
+        # --- Decoder ---
+        # The call to seqTransDecoder remains unchanged
+        output = self.seqTransDecoder(x, final_cond_tokens, t, traj_emb, self.embeddings_table.weight, trj_dist) # embeddings_table not used
+        
+        output = self.final_layer(output)
         return output

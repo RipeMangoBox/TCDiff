@@ -11,7 +11,6 @@ def slice_AIOZmotion(motion_file, stride, length, num_slices, out_dir):
     motion = pickle.load(open(motion_file, "rb"))
     pos, q = motion["pos"], motion["q"] # (dancer_num, seq_len, smpl_pos)
     file_name = os.path.splitext(os.path.basename(motion_file))[0]
-    # normalize root position
     # pos /= scale
     start_idx = 0
     window = int(length * 30) 
