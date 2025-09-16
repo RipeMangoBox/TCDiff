@@ -14,7 +14,7 @@ def parse_train_opt():
             help="Path to raw dataset folder (must contain train/test subfolders). Do not modify unless necessary.")
     parser.add_argument("--processed_data_dir",type=str, 
                         default="./data/dataset_backups/", help="Dataset backup path") 
-    parser.add_argument("--batch_size", type=int, default=37) 
+    parser.add_argument("--batch_size", type=int, default=64) 
     parser.add_argument("--window_size", type=int, default=150, help="window size")
     parser.add_argument( 
         "--force_reload", default = False, action="store_true", help="Force reprocessing of the dataset, ignoring cached data."
@@ -45,7 +45,7 @@ def parse_train_opt():
     parser.add_argument(
         "--save_interval",
         type=int,
-        default=1,
+        default=20,
         help='Log model after every "save_period" epoch',
     )
     parser.add_argument("--ema_interval", type=int, default=1, help="ema every x steps")

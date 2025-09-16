@@ -229,7 +229,7 @@ while nb_iter <= args.total_iter:
         x, cond, filename, wavname = batch
 
         # Number of samples to render
-        render_count = 2
+        render_count = 1
 
         # Select only x and y coordinates for motion (drop z)
         x = x[:,:,:,[0,1]]

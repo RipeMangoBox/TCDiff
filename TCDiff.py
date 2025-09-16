@@ -132,104 +132,97 @@ class TCDiff:
         test_data_loader = self.accelerator.prepare(test_dataloader)
         self.normalizer = train_dataloader.dataset.normalizer
         
-        self.writer = SummaryWriter(log_dir=opt.save_dir)
-        
-        # boot up multi-gpu training. test dataloader is only on main process
-        # load_loop = (
-        #     partial(tqdm, position=0)
-        #     if self.accelerator.is_main_process
-        #     else lambda x, **kwargs: x
-        # )
-        
-        # 包装 dataloader 得到 tqdm 迭代器（仅主进程）
-        if self.accelerator.is_main_process:
-            pbar = tqdm(train_data_loader, position=1, desc="Batch")
-        else:
-            pbar = train_data_loader  # 非主进程不包装
-
+        # --- No changes needed here ---
         if self.accelerator.is_main_process:
             save_dir = str(increment_path(Path(opt.project) / opt.exp_name))
             opt.exp_name = save_dir.split("/")[-1]
-            # wandb.init(project=opt.wandb_pj_name, name=opt.exp_name)
             save_dir = Path(save_dir)
-            wdir = save_dir / "weights" # save ckpt path
+            wdir = save_dir / "weights"
             wdir.mkdir(parents=True, exist_ok=True)
             self.writer = SummaryWriter(os.path.join(wdir, "tensorboard"))
 
         self.accelerator.wait_for_everyone()
-        print("Begin Traning")
+        print("Begin Training")
         for epoch in range(1, opt.epochs + 1):
             avg_loss = 0
             avg_vloss = 0
             avg_footloss = 0
             
             self.train()
-            # for step, batch in enumerate(
-            #     pbar
-            # ):
-            #     batch_data = batch_data_process(batch)
-            #     x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
-            #     x = torch.stack([x, lmotion], dim=1)
-            #     total_loss, (loss, v_loss, foot_loss) = self.diffusion( 
-            #         x, lmotion, music, t_override=None 
-            #     )
-            #     loss_dict = {
-            #         "loss": loss.item(),
-            #         "v_loss": v_loss.item(),
-            #         "foot_loss": foot_loss.item(),
-            #     }
+
+            # Create the tqdm pbar only on the main process
+            if self.accelerator.is_main_process:
+                pbar = tqdm(train_data_loader, position=0, desc=f"Epoch {epoch}/{opt.epochs}")
+            else:
+                pbar = train_data_loader
+
+            for step, batch in enumerate(pbar):
+                # Calculate a global step for a continuous x-axis in TensorBoard
+                global_step = (epoch - 1) * len(train_data_loader) + step
+
+                batch_data = batch_data_process(batch)
+                x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+                x = torch.stack([x, lmotion], dim=1)
+                total_loss, (loss, v_loss, foot_loss) = self.diffusion( 
+                    x, lmotion, music, t_override=None 
+                )
                 
-            #     if self.accelerator.is_main_process:
-            #         for key in loss_dict.keys():
-            #             loss_dict[key] = float(loss_dict[key])
+                # --- CHANGE 1: Log each loss individually with add_scalar ---
+                if self.accelerator.is_main_process:
+                    # Update tqdm progress bar
+                    loss_dict = {
+                        "loss": loss.item(),
+                        "v_loss": v_loss.item(),
+                        "foot_loss": foot_loss.item(),
+                    }
+                    pbar.set_postfix(loss_dict)
+                    
+                    # Log scalars to TensorBoard with a hierarchical tag
+                    self.writer.add_scalar('train/loss', loss.item(), global_step)
+                    self.writer.add_scalar('train/v_loss', v_loss.item(), global_step)
+                    self.writer.add_scalar('train/foot_loss', foot_loss.item(), global_step)
 
-            #         loss_dict.update({'step': step + 1})
-            #         pbar.set_postfix(loss_dict)
+                self.optim.zero_grad()
+                self.accelerator.backward(total_loss)
+                self.optim.step()
 
-            #     self.optim.zero_grad()
-            #     self.accelerator.backward(total_loss)
-            #     self.optim.step()
-
-            #     # ema update and train loss update only on main
-            #     if self.accelerator.is_main_process:
-            #         avg_loss += loss.detach().cpu().numpy()
-            #         avg_vloss += v_loss.detach().cpu().numpy()
-            #         avg_footloss += foot_loss.detach().cpu().numpy()
-            #         if step % opt.ema_interval == 0:
-            #             self.diffusion.ema.update_model_average(
-            #                 self.diffusion.master_model, self.diffusion.model
-            #             )
+                if self.accelerator.is_main_process:
+                    avg_loss += loss.item() # Use .item() to avoid holding onto the graph
+                    avg_vloss += v_loss.item()
+                    avg_footloss += foot_loss.item()
+                    if step % opt.ema_interval == 0:
+                        self.diffusion.ema.update_model_average(
+                            self.diffusion.master_model, self.diffusion.model
+                        )
                         
-            # Save model, log info, visualization for testing(from val dataset)
             if (epoch % opt.save_interval) == 0:
-                # everyone waits here for the val loop to finish ( don't start next train epoch early)
                 self.accelerator.wait_for_everyone()
-                # save only if on main thread
                 if self.accelerator.is_main_process:
                     self.eval()
-                    # log
+                    
+                    # --- CHANGE 2: Log epoch-level average losses ---
                     avg_loss /= len(train_data_loader)
                     avg_vloss /= len(train_data_loader)
                     avg_footloss /= len(train_data_loader)
-                    log_dict = {
-                        "Train Loss": avg_loss,
-                        "V Loss": avg_vloss,
-                        "Foot Loss": avg_footloss,
-                    }
-                    # wandb.log(log_dict)
-                    self.writer.add_scalars("Train Loss", log_dict, epoch)
-                    print(log_dict)
+                    
+                    # Log each average loss for the epoch
+                    self.writer.add_scalar('epoch_avg/train_loss', avg_loss, epoch)
+                    self.writer.add_scalar('epoch_avg/train_vloss', avg_vloss, epoch)
+                    self.writer.add_scalar('epoch_avg/train_footloss', avg_footloss, epoch)
+
+                    print(f"Epoch {epoch} Average Losses: Train={avg_loss:.4f}, V={avg_vloss:.4f}, Foot={avg_footloss:.4f}")
+                    
+                    # --- The rest of your saving and rendering logic ---
                     ckpt = {
                         "ema_state_dict": self.diffusion.master_model.state_dict(),
-                        "model_state_dict": self.accelerator.unwrap_model(
-                            self.model
-                        ).state_dict(),
+                        "model_state_dict": self.accelerator.unwrap_model(self.model).state_dict(),
                         "optimizer_state_dict": self.optim.state_dict(),
                         "normalizer": self.normalizer,
                     }
-                    torch.save(ckpt, os.path.join(wdir, f"train-{epoch}.pt")) # save ckpt
+                    torch.save(ckpt, os.path.join(wdir, f"train-{epoch}.pt"))
+                    
                     # generate a sample
-                    render_count = 2
+                    render_count = 1
                     shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
                     print("Generating Sample")
                     # draw a cond from the test dataset
@@ -263,7 +256,6 @@ class TCDiff:
                     print(f"[MODEL SAVED at Epoch {epoch}]")
         
         if self.accelerator.is_main_process:
-            # wandb.run.finish()
             self.writer.close()
 
 

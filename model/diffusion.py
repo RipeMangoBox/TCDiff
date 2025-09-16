@@ -760,8 +760,9 @@ class GaussianDiffusion(nn.Module):
         poses = np.transpose(poses,(0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
         poses = poses[0]
         fmotion = poses[0].reshape(150, 66)
-        lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
-        lmotion = lmotion.cpu().detach().numpy()
+        lmotion = poses[1].reshape(150, 66)
+        # lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
+        # lmotion = lmotion.cpu().detach().numpy()
         
         motions = [fmotion, lmotion]
         output_path = f'{render_out}/videos'
