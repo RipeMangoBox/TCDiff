@@ -24,10 +24,16 @@ def train(opt):
     #     )
     #     setattr(train_dataloader.dataset, "normalizer", normalizer)
 
+
+    ckpt_epoch = opt.checkpoint.split("-")[-1].split(".")[0]
     model = TCDiff(checkpoint_path = opt.checkpoint, learning_rate=opt.learning_rate, \
         window_size=opt.window_size, required_dancer_num = opt.required_dancer_num, opt=opt)
     if opt.mode == "train":
         model.train_loop(opt)
+    elif opt.mode == "render":
+        # model.long_sample(ckpt_epoch, opt.render_dir, 240)
+        # model.long_sample(ckpt_epoch, opt.render_dir, 150)
+        model.long_sample(ckpt_epoch, opt.render_dir, None)
     elif opt.mode == "val_without_TrajModel":
         model.given_trajectory_generation_loop(opt)
     elif opt.mode == "test":

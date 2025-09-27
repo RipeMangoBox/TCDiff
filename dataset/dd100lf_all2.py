@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import os
 import random
-from dataset.preprocess import vectorize_many, Normalizer
+from dataset.preprocess import Normalizer, vectorize_many
 
 def to_torch(ndarray):
     if type(ndarray).__module__ == 'numpy':
@@ -151,73 +151,75 @@ class DD100lfAll2(Dataset):
         keys = ['pos3dl', 'pos3df', 'music']
         for i in range(len(self.dances['pos3dl'])):
             min_len = min(len(self.dances[k][i]) for k in keys)
-            min_len = min_len - min_len % 2
+            min_len = min_len - min_len % 4
             for k in keys:
                 self.dances[k][i] = self.dances[k][i][:min_len]
             
         print('DD100lfAll2 dataset loaded!')   
-
-        global_pose_vec_input = torch.from_numpy(np.concatenate([self.dances['pos3dl'], self.dances['pos3df']], axis=0)).float().detach()
-        global_pose_vec_input = vectorize_many(global_pose_vec_input)
+    
         if self.split == 'train':
+            global_pose_vec_input = torch.from_numpy(np.concatenate([self.dances['pos3dl'], self.dances['pos3df']], axis=0)).float().detach()
+            global_pose_vec_input = vectorize_many(global_pose_vec_input)
             self.normalizer = Normalizer(global_pose_vec_input)
         elif self.split == 'test':
             assert normalizer is not None
             self.normalizer = normalizer
-            
-    # def _load_music_features(self, seq_name):
-    #     music_path = os.path.join(self.music_root, 'jukebox', self.split, f"{seq_name}.npy")
-    #     music_features = np.load(music_path).astype(np.float32)
-    #     return music_features
+        # self.dances['pos3dl'] = self.normalizer.normalize(self.dances['pos3dl'])
+        # self.dances['pos3df'] = self.normalizer.normalize(self.dances['pos3df'])
+
+    def _load_music_features(self, seq_name):
+        music_path = os.path.join(self.music_root, 'jukebox', self.split, f"{seq_name}.npy")
+        music_features = np.load(music_path).astype(np.float32)
+        return music_features
     
-    # def _load_motion_sequence(self, seq_name):
-    #     leader_path = os.path.join(self.motion_root, 'pos3d', self.split, f"{seq_name}_01.npy")
-    #     follower_path = os.path.join(self.motion_root, 'pos3d', self.split, f"{seq_name}_00.npy")
-    #     music_features = self._load_music_features(seq_name)
-    #     lmotion = np.load(leader_path)
-    #     fmotion = np.load(follower_path)
+    def _load_motion_sequence(self, seq_name):
+        leader_path = os.path.join(self.motion_root, 'pos3d', self.split, f"{seq_name}_01.npy")
+        follower_path = os.path.join(self.motion_root, 'pos3d', self.split, f"{seq_name}_00.npy")
+        music_features = self._load_music_features(seq_name)
+        lmotion = np.load(leader_path)
+        fmotion = np.load(follower_path)
 
-    #     min_len = min(len(lmotion), len(fmotion), len(music_features))
-    #     lmotion = lmotion[:min_len, :66]
-    #     fmotion = fmotion[:min_len, :66]
-    #     # lroot_init = lmotion[0, :3]
-    #     # lmotion = lmotion - np.tile(lroot_init, (min_len, 22))
-    #     # fmotion = fmotion - np.tile(lroot_init, (min_len, 22))
-    #     music_features = music_features[:min_len]
+        min_len = min(len(lmotion), len(fmotion), len(music_features))
+        lmotion = lmotion[:min_len, :66]
+        fmotion = fmotion[:min_len, :66]
+        # lroot_init = lmotion[0, :3]
+        # lmotion = lmotion - np.tile(lroot_init, (min_len, 22))
+        # fmotion = fmotion - np.tile(lroot_init, (min_len, 22))
+        music_features = music_features[:min_len]
         
-    #     lcontacts = compute_contacts(lmotion)
-    #     fcontacts = compute_contacts(fmotion)
-    #     lmotion = np.concatenate([lcontacts, lmotion], axis=-1)
-    #     fmotion = np.concatenate([fcontacts, fmotion], axis=-1)
+        lcontacts = compute_contacts(lmotion)
+        fcontacts = compute_contacts(fmotion)
+        lmotion = np.concatenate([lcontacts, lmotion], axis=-1)
+        fmotion = np.concatenate([fcontacts, fmotion], axis=-1)
 
-    #     group_motion_data = {
-    #         'group_poses': np.stack([lmotion, fmotion], axis=0),  # (2, seq_len, 66)
-    #         'group_trans': None,  # Not separate in DD100, included in xyz
-    #         'meta': {'orig_start': 0, 'orig_end': min_len}
-    #     }
+        group_motion_data = {
+            'group_poses': np.stack([lmotion, fmotion], axis=0),  # (2, seq_len, 66)
+            'group_trans': None,  # Not separate in DD100, included in xyz
+            'meta': {'orig_start': 0, 'orig_end': min_len}
+        }
         
-    #     return group_motion_data
+        return group_motion_data
     
-    # def _process_poses(self, group_motion_data, frame_ix):
-    #     group_poses = group_motion_data['group_poses'][:, frame_ix]  # (2, target_seq_len, 66)
-    #     n_persons, seq_len, pose_dim = group_poses.shape
+    def _process_poses(self, group_motion_data, frame_ix):
+        group_poses = group_motion_data['group_poses'][:, frame_ix]  # (2, target_seq_len, 66)
+        n_persons, seq_len, pose_dim = group_poses.shape
 
-    #     # Apply DD100-specific processing
-    #     lmotion = group_poses[0]  # Leader
-    #     fmotion = group_poses[1]  # Follower
+        # Apply DD100-specific processing
+        lmotion = group_poses[0]  # Leader
+        fmotion = group_poses[1]  # Follower
 
-    #     group_poses = np.stack([lmotion, fmotion], axis=0)  # (2, gt_length, 66), note: length may be seq_len-1 due to drop
-    #     group_poses = to_torch(group_poses)
+        group_poses = np.stack([lmotion, fmotion], axis=0)  # (2, gt_length, 66), note: length may be seq_len-1 due to drop
+        group_poses = to_torch(group_poses)
 
-    #     gt_length = group_poses.shape[1]
-    #     if gt_length < self.max_length:
-    #         padding_len = self.max_length - gt_length
-    #         padding_zeros = torch.zeros((n_persons, padding_len, pose_dim))
-    #         group_poses = torch.cat((group_poses, padding_zeros), dim=1)
+        gt_length = group_poses.shape[1]
+        if gt_length < self.max_length:
+            padding_len = self.max_length - gt_length
+            padding_zeros = torch.zeros((n_persons, padding_len, pose_dim))
+            group_poses = torch.cat((group_poses, padding_zeros), dim=1)
 
-    #     ret = group_poses.float()  # (2, max_length, 66)
+        ret = group_poses.float()  # (2, max_length, 66)
 
-    #     return ret
+        return ret
     
     def __len__(self):
         return len(self.dances['pos3dl'])

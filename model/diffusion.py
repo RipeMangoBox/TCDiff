@@ -16,6 +16,7 @@ from vis import skeleton_render
 from .utils import extract, make_beta_schedule
 import copy
 from intergen_vis import generate_one_sample
+from rd_process import save_pos3d, motion_temporal_filter
 
 def identity(t, *args, **kwargs):
     return t
@@ -302,7 +303,7 @@ class GaussianDiffusion(nn.Module):
 
         x_start = None
 
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next in time_pairs:
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             pred_noise, x_start, *_ = self.model_predictions(x, lmotion, cond, time_cond, clip_x_start = self.clip_denoised)
 
@@ -370,7 +371,7 @@ class GaussianDiffusion(nn.Module):
 
         x_start = None
 
-        for time, time_next, weight in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next, weight in time_pairs:
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             pred_noise, x_start, *_ = self.model_predictions(x, lmotion, cond, time_cond, weight=weight, clip_x_start = self.clip_denoised) 
 
@@ -635,7 +636,282 @@ class GaussianDiffusion(nn.Module):
         t = torch.full((batch_size,), timestep, device=x.device).long()
         return self.q_sample(x, t) if timestep > 0 else x
 
-    def render_sample( 
+    # def render_sample( 
+    #     self,
+    #     shape,
+    #     lmotion,
+    #     cond,
+    #     normalizer,
+    #     epoch,
+    #     render_out,
+    #     name=None,
+    #     sound=True,
+    #     mode="normal",
+    #     noise=None,
+    #     constraint=None,
+    #     sound_folder="ood_sliced",
+    #     start_point=None,
+    #     render=True,
+    #     required_dancer_num = 4,
+    #     x_0 = None,
+    #     render_len = 512,
+    # ):
+    #     if isinstance(shape, tuple):
+    #         if mode == "inpaint": # Inpainting mode: fills in missing frames within an existing sequence
+    #             func_class = self.inpaint_loop
+    #         elif mode == "normal":# Standard generation mode for regular-length motion sequences
+    #             func_class = self.ddim_sample
+    #         elif mode == "long": # Long generation mode for producing extended motion sequences
+    #             func_class = self.long_ddim_sample
+    #         elif mode == "ctrl": # Control mode for motion retargeting based on given trajectories and partial footstep constraints
+    #             func_class = self.ddim_sample_Footwork
+    #         else:
+    #             assert False, "Unrecognized inference mode"
+    #         samples = (
+    #             func_class(
+    #                 shape,
+    #                 lmotion,
+    #                 cond,
+    #                 noise=noise,
+    #                 constraint=constraint,
+    #                 start_point=start_point,
+    #                 x_0 = x_0,
+    #             )
+    #             .detach()
+    #             .cpu()
+    #         )            # for step, batch in enumerate(pbar):
+    #     else:
+    #         samples = shape
+
+    #     # (b, s*dancer_num, c)
+    #     b,s,_ = samples.shape # [*, 450, 70]
+    #     samples = normalizer.unnormalize(samples) # torch.Size([2, 150*dancer_num, 70])
+
+    #     # (b, s*dancer_num, c) -> (b, s, dancer_num, c)
+    #     samples = samples.reshape(b, 150, s//150, 70) # [*, 150, 3, 70]
+    #     b, s, ds, c = samples.shape # In long_DDPM_sample, b refers to the number of audio segments rather than the batch size.
+
+    #     if len(samples.shape) == 4 and samples.shape[3] == 70: # (b, s, dancer_num, c)
+    #         sample_contact, samples = torch.split(
+    #             samples, (4, samples.shape[3] - 4), dim=3
+    #         )
+    #     else:
+    #         sample_contact = None
+
+    #     samples = samples.reshape(b,-1,c-4) # (b, s, dancer_num, c-4(147)) -> (b, s*dancer_num, c-4(147))
+    #     b, s, c = samples.shape # (b, s*dancer_num, c-4(147))
+    #     pos = samples.to(cond.device)  # (b, s*dancer_num, 3) | np.zeros((sample.shape[0], 3))
+
+    #     if mode == "long": #For testing, outputs concatenated motion data (pos, q). When a full audio clip is input, b denotes the number of audio slices.
+    #         pos = pos.reshape(b, 150, required_dancer_num, -1) # (b, s*dancer_num, 3) -> (b, s, dancer_num, 3)
+    #         b, s, dn, c1, c2 = q.shape
+    #         assert s % 2 == 0
+    #         half = s // 2
+
+    #         if b >= 1: # If there is more than one slice
+    #             # Concatenate each dancer's motion separately
+    #             pos_all = torch.tensor([]).to(pos.device)
+    #             for dancer_i in range(dn):
+    #                 cur_pos = pos[:, :, dancer_i, :].reshape(b, 150, -1)    
+    #                 # if long mode, stitch position using linear interp
+    #                 fade_out = torch.ones((1, s, 1)).to(cur_pos.device)
+    #                 fade_in = torch.ones((1, s, 1)).to(cur_pos.device)
+    #                 fade_out[:, half:, :] = torch.linspace(1, 0, half)[None, :, None].to(
+    #                     cur_pos.device
+    #                 )
+    #                 fade_in[:, :half, :] = torch.linspace(0, 1, half)[None, :, None].to(
+    #                     cur_pos.device
+    #                 )
+
+    #                 cur_pos[:-1] *= fade_out
+    #                 cur_pos[1:] *= fade_in
+
+    #                 full_pos = torch.zeros((s + half * (b - 1), 3)).to(cur_pos.device)
+    #                 idx = 0
+    #                 for pos_slice in cur_pos:
+    #                     full_pos[idx : idx + s] += pos_slice
+    #                     idx += half
+
+    #                 # stitch joint angles with slerp
+    #                 pos_all = torch.concat([pos_all,full_pos.reshape(-1, 1, 3)],dim = 1) # (b*s, dancer_num, 3)
+
+    #             # reshape for fk 
+    #             bs, dn, _ = pos_all.shape
+    #             full_pos = pos_all.reshape(1, bs*dn, 3) # (b*s, dancer_num, 3) -> (1, b*s, dancer_num, 3)
+
+    #         else:
+    #             full_pos = pos
+
+    #         full_pos = full_pos.reshape(1,-1,3)
+    #         full_pose = full_pos  # b, s*dancer_num, 22, 3
+
+    #         # reshape (1, b*s*dancer_num, 22, 3) -> (1, b*s, dancer_num, 22, 3) -> (1, dancer_num, b*s, 22, 3)
+            
+    #         full_pose = full_pose.reshape(1, bs, dn, 22, 3)
+    #         full_pose = np.transpose(full_pose, (0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
+
+    #         return
+    #     poses = pos.detach().cpu().numpy() # [2, 450, 22, 3] [2, 3, 3] | (b, s*dancer_num, 22, 3), key points
+    #     # permute contact (b, seq, dancer_num, 4) -> (b, dancer_num, seq, 4)
+    #     sample_contact = np.transpose(sample_contact,(0,2,1,3))
+
+    #     b = poses.shape[0]
+    #     poses = poses.reshape(b,-1,required_dancer_num,22,3)
+    #     poses = np.transpose(poses,(0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
+    #     poses = poses[0]
+    #     fmotion = poses[0].reshape(150, 66)
+    #     # lmotion = poses[1].reshape(150, 66)
+    #     lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
+    #     lmotion = lmotion.cpu().detach().numpy()
+        
+    #     motions = [fmotion, lmotion]
+    #     output_path = render_out
+    #     os.makedirs(output_path, exist_ok=True)
+    #     generate_one_sample(motions, f'{name[0]}_e{epoch}', output_path)
+    
+    # def render_sample( 
+    #     self,
+    #     shape,
+    #     lmotion,
+    #     cond,
+    #     normalizer,
+    #     epoch,
+    #     render_out,
+    #     name=None,
+    #     sound=True,
+    #     mode="normal",
+    #     noise=None,
+    #     constraint=None,
+    #     sound_folder="ood_sliced",
+    #     start_point=None,
+    #     render=True,
+    #     required_dancer_num = 4,
+    #     x_0 = None,
+    #     render_len = 512,
+    #     full_lmotion=None, # New parameter
+    #     idx_list=None,     # New parameter
+    # ):
+    #     """
+    #     Generates and renders motion, handling only XYZ position data.
+    #     In 'long' mode, it stitches overlapping segments together.
+    #     """
+    #     # 1. Generate the normalized motion samples from the diffusion model
+    #     if isinstance(shape, tuple):
+    #         if mode == "long":
+    #             func_class = self.long_ddim_sample
+    #         else: # "normal", "inpaint", etc.
+    #             func_class = self.ddim_sample
+            
+    #         samples = (
+    #             func_class(
+    #                 shape,
+    #                 lmotion,
+    #                 cond,
+    #                 noise=noise,
+    #                 constraint=constraint,
+    #                 start_point=start_point,
+    #                 x_0=x_0,
+    #             )
+    #             .detach()
+    #             .cpu()
+    #         )
+    #     else:
+    #         samples = shape
+
+    #     # 2. Unnormalize the data to its original scale
+    #     samples = normalizer.unnormalize(samples)
+
+    #     # 3. Reshape for multi-dancer format
+    #     # Input shape: (batch, seq_len * num_dancers, features)
+    #     b, _, c = samples.shape 
+    #     seq_len = self.horizon # The length of a single block/slice
+
+    #     sample_contact, samples = torch.split(samples, (4, samples.shape[-1] - 4), dim=-1)
+
+    #     samples = samples.reshape(b,-1,c-4) # (b, s, dancer_num, c-4(147)) -> (b, s*dancer_num, c-4(147))
+    #     b, s, c = samples.shape # (b, s*dancer_num, c-4(147))
+    #     pos = samples.to(cond.device)  # (b, s*dancer_num, 3) | np.zeros((sample.shape[0], 3))
+
+    #     # Reshape to separate the dancers: (batch, seq_len, num_dancers, features)
+    #     pos = samples.view(b, seq_len, required_dancer_num, c)
+
+    #     # 4. Handle the stitching for long sequences
+    #     if mode == "long":
+    #         fname = name[0]
+    #         b, s, dn, c = pos.shape # b=num_slices, s=seq_len, dn=dancer_num, c=xyz_dim
+            
+    #         if b > 1: # More than one slice needs stitching
+    #             # --- Stitching Logic ---
+    #             all_dancers_stitched_pos = []
+    #             for dancer_i in range(dn):
+    #                 # Get the slices for the current dancer
+    #                 dancer_pos_slices = pos[:, :, dancer_i, :] # Shape: (b, s, c)
+                    
+    #                 # Create fade in/out masks for smooth linear interpolation
+    #                 half = s // 2
+    #                 fade_out = torch.ones((1, s, 1), device=pos.device)
+    #                 fade_in = torch.ones((1, s, 1), device=pos.device)
+    #                 fade_out[:, half:, :] = torch.linspace(1, 0, half, device=pos.device).view(1, -1, 1)
+    #                 fade_in[:, :half, :] = torch.linspace(0, 1, half, device=pos.device).view(1, -1, 1)
+
+    #                 # Apply masks to the overlapping regions
+    #                 dancer_pos_slices[:-1] *= fade_out
+    #                 dancer_pos_slices[1:] *= fade_in
+
+    #                 # Use idx_list for precise placement of each slice
+    #                 total_len = idx_list[-1] + s
+    #                 stitched_pos = torch.zeros((total_len, c), device=pos.device)
+                    
+    #                 for i, pos_slice in enumerate(dancer_pos_slices):
+    #                     start_idx = idx_list[i]
+    #                     stitched_pos[start_idx : start_idx + s] += pos_slice
+                    
+    #                 all_dancers_stitched_pos.append(stitched_pos.unsqueeze(1)) # Add dancer dim back
+
+    #             # Combine all dancers into a single tensor
+    #             # Shape: (total_len, dancer_num, features)
+    #             full_pos = torch.cat(all_dancers_stitched_pos, dim=1)
+
+    #             fname = name[0]
+    #             lcontact, lmotion = torch.split(full_lmotion, (4, 66), dim=-1)
+    #             lmotion = lmotion.cpu().detach().numpy()
+    #         else: # Only one slice, no stitching needed
+    #             fname = f'{name[0]}_e{epoch}'
+    #             lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
+    #             lmotion = lmotion.cpu().detach().numpy()
+    #             full_pos = pos.squeeze(0) # Shape: (s, dn, c)
+
+    #         # Convert to numpy for saving
+    #         poses = full_pos.detach().cpu().numpy()
+    #         # Reshape to (dancer_num, total_len, features) for compatibility with saving functions
+    #         poses = np.transpose(poses, (1, 0, 2))
+
+    #     else: # Handle "normal" mode (no stitching)
+    #         fname = f'{name[0]}_e{epoch}'
+    #         # Squeeze the batch dimension as it's usually 1 for normal rendering
+    #         poses = pos.squeeze(0).detach().cpu().numpy()
+    #         # Reshape to (dancer_num, seq_len, features)
+    #         poses = np.transpose(poses, (1, 0, 2))
+
+    #     # --- Saving Logic ---
+    #     poses = pos.detach().cpu().numpy() # [2, 450, 22, 3] [2, 3, 3] | (b, s*dancer_num, 22, 3), key points
+
+    #     b = poses.shape[0]
+    #     poses = poses.reshape(b,-1,required_dancer_num,22,3)
+    #     poses = np.transpose(poses,(0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
+
+    #     fmotion = poses.reshape(1, -1, 66)[:, :render_len]
+    #     fmotion = motion_temporal_filter(fmotion, "gaussian", {"sigma":2})
+    #     lmotion = lmotion[:, :render_len]
+        
+    #     motions = [fmotion, lmotion]
+    #     output_path = render_out
+    #     os.makedirs(output_path, exist_ok=True)
+    #     save_pos3d(fmotion, lmotion, output_path, fname)
+    #     generate_one_sample(motions, fname, output_path)
+    
+    
+    def render_sample(
         self,
         shape,
         lmotion,
@@ -648,24 +924,21 @@ class GaussianDiffusion(nn.Module):
         mode="normal",
         noise=None,
         constraint=None,
-        sound_folder="ood_sliced",
         start_point=None,
         render=True,
-        required_dancer_num = 4,
-        x_0 = None,
-        render_len = 512,
+        required_dancer_num=1, # This is now conceptually fixed to 1
+        x_0=None,
+        render_len=None,
+        full_lmotion=None,
+        idx_list=None,
     ):
+        # 1. Generate motion samples from the diffusion model
         if isinstance(shape, tuple):
-            if mode == "inpaint": # Inpainting mode: fills in missing frames within an existing sequence
-                func_class = self.inpaint_loop
-            elif mode == "normal":# Standard generation mode for regular-length motion sequences
-                func_class = self.ddim_sample
-            elif mode == "long": # Long generation mode for producing extended motion sequences
+            if mode == "long":
                 func_class = self.long_ddim_sample
-            elif mode == "ctrl": # Control mode for motion retargeting based on given trajectories and partial footstep constraints
-                func_class = self.ddim_sample_Footwork
-            else:
-                assert False, "Unrecognized inference mode"
+            else: # "normal", "inpaint", etc.
+                func_class = self.ddim_sample
+            
             samples = (
                 func_class(
                     shape,
@@ -674,155 +947,72 @@ class GaussianDiffusion(nn.Module):
                     noise=noise,
                     constraint=constraint,
                     start_point=start_point,
-                    x_0 = x_0,
+                    x_0=x_0,
                 )
                 .detach()
                 .cpu()
-            )            # for step, batch in enumerate(pbar):
-            #     # Calculate a global step for a continuous x-axis in TensorBoard
-            #     global_step = (epoch - 1) * len(train_data_loader) + step
-
-            #     batch_data = batch_data_process(batch)
-            #     x, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
-            #     x = torch.stack([x, lmotion], dim=1)
-            #     total_loss, (loss, v_loss, foot_loss) = self.diffusion( 
-            #         x, lmotion, music, t_override=None 
-            #     )
-                
-            #     # --- CHANGE 1: Log each loss individually with add_scalar ---
-            #     if self.accelerator.is_main_process:
-            #         # Update tqdm progress bar
-            #         loss_dict = {
-            #             "loss": loss.item(),
-            #             "v_loss": v_loss.item(),
-            #             "foot_loss": foot_loss.item(),
-            #         }
-            #         pbar.set_postfix(loss_dict)
-                    
-            #         # Log scalars to TensorBoard with a hierarchical tag
-            #         self.writer.add_scalar('train/loss', loss.item(), global_step)
-            #         self.writer.add_scalar('train/v_loss', v_loss.item(), global_step)
-            #         self.writer.add_scalar('train/foot_loss', foot_loss.item(), global_step)
-
-            #     self.optim.zero_grad()
-            #     self.accelerator.backward(total_loss)
-            #     self.optim.step()
-
-            #     if self.accelerator.is_main_process:
-            #         avg_loss += loss.item() # Use .item() to avoid holding onto the graph
-            #         avg_vloss += v_loss.item()
-            #         avg_footloss += foot_loss.item()
-            #         if step % opt.ema_interval == 0:
-            #             self.diffusion.ema.update_model_average(
-            #                 self.diffusion.master_model, self.diffusion.model
-            #             )
-                        
+            )
         else:
             samples = shape
 
-        # (b, s*dancer_num, c)
-        b,s,_ = samples.shape # [*, 450, 70]
-        samples = normalizer.unnormalize(samples) # torch.Size([2, 150*dancer_num, 70])
+        # 2. Unnormalize and split contact data
+        samples = normalizer.unnormalize(samples)
+        sample_contact, samples = torch.split(samples, (4, samples.shape[-1] - 4), dim=-1)
+        pos = samples.to(cond.device)
 
-        # (b, s*dancer_num, c) -> (b, s, dancer_num, c)
-        samples = samples.reshape(b, 150, s//150, 70) # [*, 150, 3, 70]
-        b, s, ds, c = samples.shape # In long_DDPM_sample, b refers to the number of audio segments rather than the batch size.
-
-        if len(samples.shape) == 4 and samples.shape[3] == 70: # (b, s, dancer_num, c)
-            sample_contact, samples = torch.split(
-                samples, (4, samples.shape[3] - 4), dim=3
-            )
-        else:
-            sample_contact = None
-
-        samples = samples.reshape(b,-1,c-4) # (b, s, dancer_num, c-4(147)) -> (b, s*dancer_num, c-4(147))
-        b, s, c = samples.shape # (b, s*dancer_num, c-4(147))
-        pos = samples.to(cond.device)  # (b, s*dancer_num, 3) | np.zeros((sample.shape[0], 3))
-
-        if mode == "long": #For testing, outputs concatenated motion data (pos, q). When a full audio clip is input, b denotes the number of audio slices.
-            pos = pos.reshape(b, 150, required_dancer_num, -1) # (b, s*dancer_num, 3) -> (b, s, dancer_num, 3)
-            b, s, dn, c1, c2 = q.shape
-            assert s % 2 == 0
-            half = s // 2
-
-            if b >= 1: # If there is more than one slice
-                # Concatenate each dancer's motion separately
-                pos_all = torch.tensor([]).to(pos.device)
-                for dancer_i in range(dn):
-                    cur_pos = pos[:, :, dancer_i, :].reshape(b, 150, -1)    
-                    # if long mode, stitch position using linear interp
-                    fade_out = torch.ones((1, s, 1)).to(cur_pos.device)
-                    fade_in = torch.ones((1, s, 1)).to(cur_pos.device)
-                    fade_out[:, half:, :] = torch.linspace(1, 0, half)[None, :, None].to(
-                        cur_pos.device
-                    )
-                    fade_in[:, :half, :] = torch.linspace(0, 1, half)[None, :, None].to(
-                        cur_pos.device
-                    )
-
-                    cur_pos[:-1] *= fade_out
-                    cur_pos[1:] *= fade_in
-
-                    full_pos = torch.zeros((s + half * (b - 1), 3)).to(cur_pos.device)
-                    idx = 0
-                    for pos_slice in cur_pos:
-                        full_pos[idx : idx + s] += pos_slice
-                        idx += half
-
-                    # stitch joint angles with slerp
-                    pos_all = torch.concat([pos_all,full_pos.reshape(-1, 1, 3)],dim = 1) # (b*s, dancer_num, 3)
-
-                # reshape for fk 
-                bs, dn, _ = pos_all.shape
-                full_pos = pos_all.reshape(1, bs*dn, 3) # (b*s, dancer_num, 3) -> (1, b*s, dancer_num, 3)
-
-            else:
-                full_pos = pos
-
-            full_pos = full_pos.reshape(1,-1,3)
-            full_pose = full_pos  # b, s*dancer_num, 22, 3
-
-            # reshape (1, b*s*dancer_num, 22, 3) -> (1, b*s, dancer_num, 22, 3) -> (1, dancer_num, b*s, 22, 3)
+        # 3. Handle stitching for long sequences vs. normal generation
+        if mode == "long":
+            fname = name[0]
+            b, s, c = pos.shape # b=num_slices, s=seq_len, c=features
             
-            full_pose = full_pose.reshape(1, bs, dn, 22, 3)
-            full_pose = np.transpose(full_pose, (0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
+            if b > 1: # More than one slice needs stitching
+                # --- Stitching Logic ---
+                half = s // 2
+                fade_out = torch.ones((1, s, 1), device=pos.device)
+                fade_in = torch.ones((1, s, 1), device=pos.device)
+                fade_out[:, half:, :] = torch.linspace(1, 0, half, device=pos.device).view(1, -1, 1)
+                fade_in[:, :half:, :] = torch.linspace(0, 1, half, device=pos.device).view(1, -1, 1)
 
-            return
-        poses = pos.detach().cpu().numpy() # [2, 450, 22, 3] [2, 3, 3] | (b, s*dancer_num, 22, 3), key points
-        # permute contact (b, seq, dancer_num, 4) -> (b, dancer_num, seq, 4)
-        sample_contact = np.transpose(sample_contact,(0,2,1,3))
+                # Apply masks to the overlapping regions
+                pos[:-1] *= fade_out
+                pos[1:] *= fade_in
 
-        sample_contact = (
-            sample_contact.detach().cpu().numpy() 
-            if sample_contact is not None
-            else None
-        )
+                # Use idx_list for precise placement of each slice
+                total_len = idx_list[-1] + s
+                full_pos = torch.zeros((total_len, c), device=pos.device)
+                
+                for i, pos_slice in enumerate(pos):
+                    start_idx = idx_list[i]
+                    full_pos[start_idx : start_idx + s] += pos_slice
+            else: # Only one slice, no stitching needed
+                full_pos = pos.squeeze(0)
 
-        b = poses.shape[0]
-        poses = poses.reshape(b,-1,required_dancer_num,22,3)
-        poses = np.transpose(poses,(0,2,1,3,4)) # (b, s, dancer_num, 22, 3) -> (b, dancer_num, s, 22, 3)
-        poses = poses[0]
-        fmotion = poses[0].reshape(150, 66)
-        # lmotion = poses[1].reshape(150, 66)
-        lcontact, lmotion = torch.split(lmotion, (4, 66), dim=-1)
-        lmotion = lmotion.cpu().detach().numpy()
+            # Use the original, full-length lmotion for long samples
+            _, lmotion = torch.split(full_lmotion, (4, 66), dim=-1)
+            lmotion = lmotion.cpu().detach().numpy()
+
+        else: # Handle "normal" mode (no stitching)
+            fname = f'{name[0]}_e{epoch}'
+            full_pos = pos.squeeze(0) # Squeeze the batch dimension
+            _, lmotion = torch.split(lmotion, (4, 66), dim=-1)
+            lmotion = lmotion.cpu().detach().numpy()
+
+        # 4. Final processing and saving for both modes
+        poses = full_pos.detach().cpu().numpy()
+        fmotion = poses.reshape(1, -1, 66)
+        
+        # Truncate to the desired render length if specified
+        if render_len is not None:
+            fmotion = fmotion[:, :render_len]
+            lmotion = lmotion[:, :render_len]
+
+        # Apply temporal filtering for smoothness
+        fmotion = motion_temporal_filter(fmotion, "gaussian", {"sigma": 2})
         
         motions = [fmotion, lmotion]
         output_path = render_out
         os.makedirs(output_path, exist_ok=True)
-        generate_one_sample(motions, f'{name[0]}_e{epoch}', output_path)
-
-        # def inner(xx):
-        #     num, pose = xx
-        #     filename = name[num] if name is not None else None
-        #     contact = sample_contact[num] if sample_contact is not None else None
-        #     skeleton_render(
-        #         pose,
-        #         epoch=f"e{epoch}_b{num}",
-        #         out=render_out,
-        #         name=filename,
-        #         sound=sound,
-        #         contact=contact,
-        #     )
-
-        # p_map(inner, enumerate(poses)) # perform render here
+        
+        # # Save motion data and generate visualization
+        save_pos3d(fmotion, lmotion, output_path, fname)
+        # generate_one_sample(motions, fname, output_path)

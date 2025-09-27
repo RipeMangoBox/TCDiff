@@ -6,6 +6,7 @@ import os
 import numpy as np
 from intergen_vis import generate_one_sample
 from easydict import EasyDict
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 
 def batch_data_process(batch_data, normalizer = None, device = None):
     name, music, lmotion, fmotion, motion_lens = batch_data
@@ -253,3 +254,47 @@ def save_pos3d(posf, posl, evaldir, fname, suffix='pos3d_npy'):
     
     np.save(os.path.join(save_folder, fname + '_00'), posf)
     np.save(os.path.join(save_folder, fname + '_01'), posl)
+    
+    
+def motion_temporal_filter(motion, filter_type, filter_kwargs):
+    """
+    对 motion 数据进行时间维度上的平滑处理。
+    
+    参数:
+        motion (np.ndarray): 输入的 motion 数据，形状为 (b, n, d)，其中
+                             b 是 batch_size，n 是时序长度，d 是关节位置维度。
+        filter_type (str): 平滑滤波器类型，支持 "gaussian" 和 "savgol_filter"。
+        sigma (float): 高斯滤波的标准差（仅在 filter_type="gaussian" 时使用）。
+    
+    返回:
+        np.ndarray: 平滑后的 motion 数据，形状与输入相同。
+    """
+    b, n, d = motion.shape  # 获取 batch_size、时序长度和维度
+    
+    ret_tensor = torch.is_tensor(motion)
+    if ret_tensor:
+        device = motion.device
+        motion = motion.cpu().numpy()
+    
+    if filter_type == "gaussian":
+        # 使用高斯滤波对时间维度进行平滑
+        smoothed_motion = gaussian_filter1d(motion, sigma=filter_kwargs["sigma"], axis=1, mode='nearest')
+    
+    elif filter_type == "savgol":
+        # 使用 Savitzky-Golay 滤波对时间维度进行平滑
+        # 注意：savgol_filter 不支持直接对多维数组操作，因此需要逐 batch 处理
+        window_length = filter_kwargs["window_length"]  # 窗口长度
+        polyorder = filter_kwargs["polyorder"]      # 多项式阶数
+        
+        # 初始化输出数组
+        smoothed_motion = np.zeros_like(motion)
+        
+        for i in range(b):  # 对每个 batch 分别处理
+            smoothed_motion[i] = savgol_filter(motion[i], window_length=window_length, polyorder=polyorder, axis=0)
+    
+    else:
+        raise ValueError(f"Unsupported filter type: {filter_type}")
+    
+    if ret_tensor:
+        smoothed_motion = torch.from_numpy(smoothed_motion).to(device)
+    return smoothed_motion

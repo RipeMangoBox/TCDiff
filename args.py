@@ -51,7 +51,7 @@ def parse_train_opt():
     parser.add_argument("--ema_interval", type=int, default=1, help="ema every x steps")
     parser.add_argument(
         "--checkpoint", type=str, 
-        default = "", 
+        default = "runs/train/exp/weights/train-1000.pt", 
         help="trained checkpoint path (optional)"
     )
 
@@ -63,7 +63,7 @@ def parse_train_opt():
         help="trained trajectory path (optional, only used when mode is 'test')"
     )
     parser.add_argument("--use_normalizer", action="store_true", default = True, help="Use data normalizer")
-    parser.add_argument("--mode", default = "train", choices=["train", "val_without_TrajModel", "test"])
+    parser.add_argument("--mode", default = "render", choices=["train", "val_without_TrajModel", "test", "render"])
     parser.add_argument("--save_dir", type=str, default="./runs/train", help="Path to save the model and tensorboard")
     
     opt = parser.parse_args()

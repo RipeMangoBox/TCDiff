@@ -71,6 +71,7 @@ class MinMaxScaler:
         return self
 
     def transform(self, X):
+        return X
         X *= self.scale_.to(X.device)
         X += self.min_.to(X.device)
         if self.clip:
@@ -78,6 +79,7 @@ class MinMaxScaler:
         return X
 
     def inverse_transform(self, X):
+        return X
         X -= self.min_[-X.shape[1] :].to(X.device)
         X /= self.scale_[-X.shape[1] :].to(X.device)
         return X

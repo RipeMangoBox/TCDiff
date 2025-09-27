@@ -34,11 +34,13 @@ class Normalizer:
         self.scaler.fit(flat)
 
     def normalize(self, x):
+        return x
         batch, seq, ch = x.shape
         x = x.reshape(-1, ch)
         return self.scaler.transform(x).reshape((batch, seq, ch))
 
     def unnormalize(self, x):
+        return x
         batch, seq, ch = x.shape
         x = x.reshape(-1, ch)
         x = torch.clip(x, -1, 1)  # clip to force compatibility

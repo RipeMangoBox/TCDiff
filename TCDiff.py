@@ -28,6 +28,7 @@ from TrajDecoder.vis import render_sample as render_traj_sample
 import TrajDecoder.options.option_traj as option_traj 
 from TrajDecoder.utils.utils_model import kalman_smooth_batch
 from rd_process import batch_data_process
+import time
     
 # To resolve CUDA errors, execute unset LD_LIBRARY_PATH. See this blog post for more information. https://blog.csdn.net/BetrayFree/article/details/133868929
 
@@ -578,8 +579,37 @@ class TCDiff:
 
 
 
+    # def render_sample( # Renders long motion sequences for testing or visualization.
+    #     self, data_tuple, label, render_dir, render_count=-1, render=True, x_0 = None, render_len = 512
+    # ):
+    #     _, music, lmotion, wavname = data_tuple
+    #     assert len(music.shape) == 3
+    #     # Automatically determine the number of audio segments to render
+    #     if render_count < 0: 
+    #         render_count = len(music)
+    #     # Define the shape of the output motion sequence:
+    #     #   - batch size: render_count
+    #     #   - sequence length: horizon * number of dancers
+    #     #   - feature dimension: representation dimension per frame
+    #     shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
+    #     self.diffusion.render_sample(
+    #         shape,
+    #         music[:render_count],
+    #         lmotion[:render_count],
+    #         self.normalizer,
+    #         label, # During training: current epoch; during test: 'test'
+    #         render_dir,
+    #         name=wavname[:render_count],
+    #         sound=True,
+    #         mode="long",
+    #         render=render,
+    #         x_0 = x_0,
+    #         required_dancer_num = self.required_dancer_num,
+    #         render_len = render_len,
+    #     )
+
     def render_sample( # Renders long motion sequences for testing or visualization.
-        self, data_tuple, label, render_dir, render_count=-1, render=True, x_0 = None, render_len = 512
+        self, data_tuple, label, render_dir, render_count=-1, render=True, x_0 = None, render_len = 512, full_lmotion=None, idx_list=None
     ):
         _, music, lmotion, wavname = data_tuple
         assert len(music.shape) == 3
@@ -587,14 +617,13 @@ class TCDiff:
         if render_count < 0: 
             render_count = len(music)
         # Define the shape of the output motion sequence:
-        #   - batch size: render_count
-        #   - sequence length: horizon * number of dancers
-        #   - feature dimension: representation dimension per frame
         shape = (render_count, self.horizon*self.required_dancer_num, self.repr_dim)
+        
+        # Pass the new arguments to the diffusion model's renderer
         self.diffusion.render_sample(
             shape,
-            music[:render_count],
             lmotion[:render_count],
+            music[:render_count],
             self.normalizer,
             label, # During training: current epoch; during test: 'test'
             render_dir,
@@ -605,4 +634,109 @@ class TCDiff:
             x_0 = x_0,
             required_dancer_num = self.required_dancer_num,
             render_len = render_len,
+            full_lmotion=full_lmotion,
+            idx_list=idx_list,
         )
+        
+    def long_sample(self, epoch, save_dir, maxlen=None):
+        """
+        Generates and renders a long motion sequence by slicing a long audio clip,
+        generating motion for each slice, and stitching the results.
+        """
+        seqlen_name = f"sample_len{maxlen}" if maxlen is not None else "full"
+        Output_DIR = os.path.join(save_dir, "long", f"e{epoch}", seqlen_name)
+        os.makedirs(Output_DIR, exist_ok=True)
+        time_write_file = os.path.join(Output_DIR, f"time.txt")
+        
+        # 1. Load the test dataset for long-sequence generation
+        test_dataset = DD100lfAll2(
+                split='test', full_length=True, normalizer=self.train_dataset.normalizer
+            )
+        test_data_loader = DataLoader(
+            test_dataset,
+            batch_size=1,  # Process one long sample at a time
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=False,
+        )
+        test_data_loader = self.accelerator.prepare(test_data_loader)
+
+        print("Generating Long Sample...")
+        # 初始化计时器
+        total_forward_time = 0.0
+        
+        # 2. Iterate through the test set to get a long audio/motion pair
+        for step, batch in tqdm(enumerate(test_data_loader), desc=f'[*] synthesis'):
+            batch_data = batch_data_process(batch, self.normalizer, device=self.accelerator.device)
+            _, lmotion, music, wavnames = batch_data["fmotion"], batch_data["lmotion"], batch_data["music"], batch_data["wavnames"]
+            
+            if maxlen is None:
+                sample_len = lmotion.shape[1]  # 使用完整长度
+            else:
+                sample_len = min(maxlen, lmotion.shape[1])
+
+            # raise Exception("stop")
+            # lmotion = lmotion[:, :sample_len]
+            # music = music[:, :sample_len]
+            
+            # ⏱️ 开始计时
+            start_time = time.perf_counter()
+            
+            # Initialize empty lists to hold the overlapping slices and their indices
+            lmotion_slices = []
+            music_slices = []
+            idx_list = [] # <-- 1. Initialize the index list
+
+            # The stride for a 50% overlap, required by the stitching logic
+            block_length = self.train_dataset.max_length
+            stride = block_length // 2
+
+            # Create overlapping slices
+            for i in range(0, music.shape[1] - block_length + 1, stride):
+                music_slices.append(music[0, i:i + block_length])
+                lmotion_slices.append(lmotion[0, i:i + block_length])
+                idx_list.append(i)
+
+            # Add the final segment to ensure the entire sequence is covered
+            if music.shape[1] % stride != 0:
+                start_idx = music.shape[1] - block_length
+                music_slices.append(music[0, -block_length:])
+                lmotion_slices.append(lmotion[0, -block_length:])
+                idx_list.append(start_idx)
+
+            # Stack the list of slices into a single batch tensor
+            # Shape: (num_slices, block_length, feature_dim)
+            lmotion_batch = torch.stack(lmotion_slices, dim=0)
+            music_batch = torch.stack(music_slices, dim=0)
+
+            # The number of slices is our new batch size for rendering
+            render_count = lmotion_batch.shape[0]
+
+            # --- Call the Rendering Function ---
+            current_wavname = [wavnames[0]]
+            data_tuple = (None, music_batch, lmotion_batch, current_wavname)
+            
+            # print(f"Rendering {current_wavname[0]} from {render_count} overlapping slices.")
+            
+            self.render_sample(
+                data_tuple,
+                epoch, # Use epoch as the label for file naming
+                Output_DIR,
+                render_count=render_count,
+                render=True, # Ensure rendering happens
+                full_lmotion=lmotion, # Pass the original for comparison if needed
+                idx_list=idx_list,
+                render_len=sample_len,
+            )
+            
+            # ⏱️ 结束计时
+            end_time = time.perf_counter()
+            # 累加耗时
+            total_forward_time += (end_time - start_time)
+            
+        # 📊 打印总耗时
+        with open(time_write_file, "w") as f:
+            f.write(f"Total time: {total_forward_time:.4f} seconds, average forward time: {total_forward_time / len(test_dataset)} seconds")
+        print(f"[INFO] Total time: {total_forward_time:.4f} seconds, average forward time: {total_forward_time / len(test_dataset)} seconds")
+            
